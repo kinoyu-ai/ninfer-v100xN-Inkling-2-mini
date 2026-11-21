@@ -189,8 +189,9 @@ SequenceRegions build_sequence_regions(const SequenceLayoutSpec& spec) {
     const std::int32_t num_kv = kNumKVHeads / spec.tp;
     const std::int32_t kv_dim = num_kv * kHeadDim;
     const std::int32_t B      = static_cast<std::int32_t>(spec.max_concurrency);
-    const std::int32_t max_T =
-        std::max<std::int32_t>(static_cast<std::int32_t>(spec.prefill_chunk), B * kMtpMaxBlockSize);
+    const std::int32_t max_T = std::max<std::int32_t>(
+        {static_cast<std::int32_t>(spec.prefill_chunk), B * kMtpMaxBlockSize,
+         spec.mtp_enabled ? kMtpMarkovRank : 1});
     const std::int32_t max_dec_T = B * (spec.mtp_enabled ? kMtpMaxBlockSize : 1);
     const std::uint32_t logical_pages = pages_for_tokens(spec.max_context);
 
@@ -293,8 +294,9 @@ WorkspaceRegions build_workspace_regions(const SequenceLayoutSpec& spec) {
     const std::int32_t slabs  = 2 / spec.tp;
     const std::int32_t vrows  = kPaddedVocabSize / spec.tp;
     const std::int32_t B      = static_cast<std::int32_t>(spec.max_concurrency);
-    const std::int32_t max_T =
-        std::max<std::int32_t>(static_cast<std::int32_t>(spec.prefill_chunk), B * kMtpMaxBlockSize);
+    const std::int32_t max_T = std::max<std::int32_t>(
+        {static_cast<std::int32_t>(spec.prefill_chunk), B * kMtpMaxBlockSize,
+         spec.mtp_enabled ? kMtpMarkovRank : 1});
     const std::int32_t max_dec_T = B * (spec.mtp_enabled ? kMtpMaxBlockSize : 1);
 
     w.cur        = b.add_tensor(DType::BF16, {kHiddenSize, max_T}, 256, "cur");

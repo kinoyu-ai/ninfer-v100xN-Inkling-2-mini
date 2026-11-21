@@ -1,7 +1,8 @@
 # Inkling-2-Mini on Tesla V100 (`sm_70`)
 
-This fork of [`tuxKOH/ninfer-v100xN`](https://github.com/tuxKOH/ninfer-v100xN) adds native,
-lossless support and Volta (`sm_70`) optimizations for
+This fork of [`tuxKOH/ninfer-v100xN`](https://github.com/tuxKOH/ninfer-v100xN) was developed and
+optimized with **Codex** and **Antigravity (Agy)**. It adds native, lossless support and Volta
+(`sm_70`) optimizations for
 [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 (`inkling2-mini/nvfp4-mxfp8`), including its **DSpark** multi-token speculative drafter
 (`mtp.safetensors`).
@@ -128,9 +129,21 @@ Workload: 4 essay prompts, `max_tokens=256`, `temperature=0.0`, thinking ON, 16-
 - **Long-context & concurrency**: verified exact needle retrieval at 4,184 prompt tokens
   (exercising >4 SWA-1024 ring wraps and >64 paged global KV pages), plus `C=8` concurrent
   greedy and stochastic (`temperature=0.7, top_p=0.95`) stability.
+- **V100-32GB×2 and V100-32GB×1 compatibility**:
+  - **Dynamic VRAM & KV planning**: No 16 GB VRAM cap is hardcoded. On 2× V100-32GB (~22 GiB/GPU
+    free after weights), full native **262,144-token** context (`~4.0 GiB/GPU` Normal or
+    `~4.5 GiB/GPU` DSpark paged BF16 global KV) and concurrent `C=8` long-context serving fit with
+    ample headroom.
+  - **Interconnect portability**: Startup (`ops::enable_peer_access`) automatically qualifies
+    direct **NVLink P2P**, direct **PCIe P2P**, or **non-P2P** fallback (verified CUDA UVA D2D
+    staging / WSL2 mapped-host packets). Fused TP2 packet-push AllReduce + ShortConv activates
+    whenever direct P2P packet mailboxes are allocated and cleanly falls back to standard
+    `allreduce_sum` + `sconv_static_decode` otherwise.
+  - **TP1 (`--tp 1`)**: Resident weights require `~17.66 GiB`, which exceeds a 16 GB V100 (TP2
+    required on 16 GB) but fits on a single 32 GB V100. TP1 sharding, bindings, and operator paths
+    are implemented and verified by unit tests (`ninfer_inkling2_ops_test`), though whole-model
+    benchmarks so far were measured on 2× V100-SXM2-16GB (`--tp 2`).
 - **Limitations**:
-  - **TP2 required on 16 GB V100**: resident weights require `~17.66 GiB`, exceeding a single
-    16 GB V100 (TP1 op kernels are validated by unit tests; whole-model runs use `--tp 2 --devices 0,1`).
   - **Batched FP associativity (`C >= 2`)**: grouped MoE `w2` accumulates via `atomicAdd`, so
     multi-request greedy runs can diverge late on near-tied logits relative to `C=1`.
   - **Downstream benchmarks**: exact PyTorch parity and FP64 operator correctness are verified;

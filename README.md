@@ -4,8 +4,9 @@
 
 ## Fork addition: native lossless Inkling-2-Mini (`inkling2-mini/nvfp4-mxfp8`)
 
-This fork of [`tuxKOH/ninfer-v100xN`](https://github.com/tuxKOH/ninfer-v100xN) adds native,
-lossless support and Volta `sm_70` optimizations for
+This fork of [`tuxKOH/ninfer-v100xN`](https://github.com/tuxKOH/ninfer-v100xN) was developed and
+optimized using **Codex** and **Antigravity (Agy)**. It adds native, lossless support and Volta
+`sm_70` optimizations for
 [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
 (48 logical looped layers, NVFP4 layers 0–19 + MXFP8 layers 20–23 + BF16 dense/KV + BF16 DSpark
 speculative drafter, zero requantization).
@@ -22,9 +23,14 @@ Measured on **2 × Tesla V100-SXM2 16 GB** (PCIe P2P, **150 W** power cap, CUDA 
 
 Verified with **76/76** FP64/TP2 operator unit tests, **32/32** exact token parity against the
 PyTorch reference across Normal (Graph/Eager) and DSpark-2/3/7, HF `AutoTokenizer` parity,
-4K SWA-1024/Paged-KV long-context retrieval, and `C=1..8` concurrent serving.
+4K SWA-1024/Paged-KV long-context retrieval, full native 262K max-context planning, and `C=1..8`
+concurrent serving.
+**V100-32GB×2 compatibility**: memory planning and P2P/NVLink/UVA-fallback transport are
+hardware-agnostic (no 16 GB VRAM or PCIe-only assumptions), so 2× V100-32GB (NVLink, PCIe P2P, or
+non-P2P) and single-card V100-32GB (`--tp 1`) are supported by the same `sm_70` build (hardware
+qualification on a physical 32 GB V100 host has not yet been recorded separately).
 See [docs/inkling2-mini.md](docs/inkling2-mini.md) for conversion (`tools/convert/inkling2_mini/convert.py`),
-launch commands, optimization details, and limitations (TP2 required on 16 GB V100).
+launch commands, optimization details, and limitations.
 
 ---
 
