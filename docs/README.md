@@ -9,6 +9,7 @@ comparison, CUDA 12.8 build and API launch. Other hardware and experiments have 
 | Document | Purpose |
 |---|---|
 | [CLI](cli.md) | text, chat-history, image/video input, output streams, sampling, MTP, dual-GPU (`--tp 2`) execution, and common runtime options |
+| [Inkling-2-Mini](inkling2-mini.md) | native lossless NVFP4/MXFP8 conversion, DSpark speculative decoding, Volta SM70 kernels, and 2× V100 measurements |
 | [HTTP serving](serving.md) | OpenAI Responses/Chat Completions, Anthropic Messages, state, streaming, token counting, authentication, tool calls, dual-GPU serving, and YaRN extended context |
 | [TUI / 终端启动器](tui.md) | SSH/local terminal API launch, explicit model/device selection, MTP/DFlash presets, live logs and owned-process stop |
 | [Docker](docker.md) | CUDA 12.8 / V100 image, automatic QUASAR download, custom model URLs, persistent settings and default TUI |
@@ -39,6 +40,7 @@ The executable `--help` output is the exact source for command-line option spell
 | Qwen3.8-27B | `nvfp4` | [Hugging Face](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer) | [model card](../model-cards/Qwen3.8-27B-nvfp4-NInfer/README.md) |
 | Qwen3.8-27B | `gguf-q4-k-m` (local V100 profile) | generated locally as `qwen3_8_27b_q4_k_m.ninfer` | Text/MTP only; embedded Vision objects are validation-only |
 | Qwen3.6-35B-A3B | `groupwise-int` | [Hugging Face](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) | [published model card](https://huggingface.co/neroued/Qwen3.6-35B-A3B-NInfer) |
+| Inkling-2-Mini | `nvfp4-mxfp8` (V100 TP2 fork profile) | converted locally via `tools/convert/inkling2_mini/convert.py` | [Inkling-2-Mini guide](inkling2-mini.md); lossless NVFP4/MXFP8/BF16 + DSpark |
 
 ## Repository-local guides
 

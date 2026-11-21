@@ -1,6 +1,32 @@
 # ninfer-v100xN
 
-[中文](README.zh-CN.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
+[中文](README.zh-CN.md) · [Inkling-2-Mini](docs/inkling2-mini.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
+
+## Fork addition: native lossless Inkling-2-Mini (`inkling2-mini/nvfp4-mxfp8`)
+
+This fork of [`tuxKOH/ninfer-v100xN`](https://github.com/tuxKOH/ninfer-v100xN) adds native,
+lossless support and Volta `sm_70` optimizations for
+[`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini)
+(48 logical looped layers, NVFP4 layers 0–19 + MXFP8 layers 20–23 + BF16 dense/KV + BF16 DSpark
+speculative drafter, zero requantization).
+
+Measured on **2 × Tesla V100-SXM2 16 GB** (PCIe P2P, **150 W** power cap, CUDA 12.8, CUDA Graphs):
+
+| Workload / Mode | NInfer (lossless NVFP4+MXFP8) | `llama.cpp` `UD-Q4_K_XL` | `llama.cpp` `UD-Q8_K_XL` |
+|---|---:|---:|---:|
+| Essay 256 tok, C=1 Normal / DSpark-2 (e2e) | **104.8** / **106.9 tok/s** | 30.7 tok/s | 29.3 tok/s |
+| Essay 256 tok, C=4 Normal / DSpark-2 (agg) | **238.0** / 175.4 tok/s | 78.3 tok/s | 55.9 tok/s |
+| Essay 256 tok, C=8 Normal (agg) | **313.2 tok/s** | — | — |
+| Code refactor 256 tok, C=1 Normal / DSpark-3 | 106.1 / **165.4 tok/s** | — | — |
+| 4,184-tok needle retrieval, C=1 Normal / DSpark-3 | 83.0 / **139.8 tok/s** | — | — |
+
+Verified with **76/76** FP64/TP2 operator unit tests, **32/32** exact token parity against the
+PyTorch reference across Normal (Graph/Eager) and DSpark-2/3/7, HF `AutoTokenizer` parity,
+4K SWA-1024/Paged-KV long-context retrieval, and `C=1..8` concurrent serving.
+See [docs/inkling2-mini.md](docs/inkling2-mini.md) for conversion (`tools/convert/inkling2_mini/convert.py`),
+launch commands, optimization details, and limitations (TP2 required on 16 GB V100).
+
+---
 
 **Compared with the decode implementation before v0.1.0, committed throughput on the same 85K-token
 code task increased from 143.46 to 198.10 tok/s — about 38.1% faster.** Both measurements
@@ -301,6 +327,7 @@ eight-card host. With `CUDA_VISIBLE_DEVICES=4,6`, use logical devices `0,1`.
 
 | Document | Scope |
 |---|---|
+| [Inkling-2-Mini (V100 TP2)](docs/inkling2-mini.md) | native lossless NVFP4/MXFP8 conversion, DSpark speculative decoding, and 2× V100 benchmarks |
 | [TP4 / NVLink](docs/tp4.md) | four-card hosts, QUASAR/official NVFP4/native FP8 and matched TP2 controls |
 | [Other V100 measurements](docs/performance-v100.md) | official NVFP4, Q4_K_M, P2P/staging controls and prefix tests |
 | [RAM-KV / PP2 experiments](docs/experiments.md) | approximate retrieval and startup-fixed layer pipeline |
@@ -344,6 +371,8 @@ The NVFP4 artifact uses the mixed FP8/NVFP4 weights from
 [Neroued](https://huggingface.co/neroued/Qwen3.8-27B-nvfp4-NInfer).
 The recommended QUASAR profile uses [QUASAR-QAT's checkpoint](https://huggingface.co/QUASAR-QAT/Qwen3.8-27B-QUASAR-NVFP4)
 and [MirkoCovizzi's NInfer conversion](https://huggingface.co/MirkoCovizzi/Qwen3.8-27B-QUASAR-NVFP4-NInfer).
+Inkling-2-Mini support converts weights directly from
+[thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) without requantization.
 
 NInfer and this fork are licensed under [Apache-2.0](LICENSE). See [NOTICE](NOTICE) for required
 attribution; third-party dependencies retain their own license files.

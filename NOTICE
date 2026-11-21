@@ -128,3 +128,34 @@ Vendored dependencies retain their own license files under third_party/.
 
 CPU visual encoding uses BLAS (OpenBLAS in the Linux prebuilt package), BSD 3-Clause.
 Copyright (c) 2011-2014, The OpenBLAS Project. License: third_party/licenses/OpenBLAS.txt.
+
+Inkling-2-Mini fork modifications
+---------------------------------
+Copyright 2026 kinoyu-ai.
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This fork derives from tuxKOH/ninfer-v100xN at commit d0a1212e and adds native,
+lossless support and Volta SM70 optimizations for thinkingmachines/Inkling-2-Mini
+(`inkling2-mini/nvfp4-mxfp8`):
+
+  * tools/convert/inkling2_mini,   lossless `.ninfer` v2 artifact converter
+    tools/reference/inkling2_mini  (preserving native NVFP4, MXFP8, BF16/FP32
+                                   weights and BF16 DSpark MTP tensors) and
+                                   PyTorch reference oracle script
+  * include/ninfer/ops/inkling2.h, Volta SM70 kernels for fused BF16 linear
+    src/ops/inkling2/              projections, Block AttnRes, cross-pass loop
+                                   control, static/dynamic ShortConv (W=4) with
+                                   fused TP2 packet-push AllReduce, SWA-1024 +
+                                   Paged Global BF16 attention, Last-CTA fused
+                                   MoE routing, coalesced NVFP4/MXFP8 sparse
+                                   MoE, and DSpark folded Markov RNN drafting
+  * src/targets/inkling2_mini/,    target registration, artifact bindings,
+    src/targets/registry.*,        tokenizer/chat-template frontend, TP1/TP2
+    src/runtime/engine/,           concurrent C=1..8 execution, CUDA Graphs,
+    src/artifact/, src/core/       and DSpark MTP/DFlash speculative decoding
+  * tests/ops/test_inkling2_ops.cpp 76-case FP64 operator and TP1/TP2 parity
+                                   verification suite
+
+Model weights are not included in this repository. Converted `.ninfer` artifacts
+derive from https://huggingface.co/thinkingmachines/Inkling-2-Mini and remain
+subject to the upstream model checkpoint's license.
