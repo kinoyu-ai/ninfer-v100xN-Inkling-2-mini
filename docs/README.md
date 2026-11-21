@@ -1,6 +1,6 @@
 # NInfer documentation
 
-Start with the [project README](../README.md) or [中文文档](../README.zh-CN.md) for the
+Start with the [project README](../README.md), [日本語 README](../README.ja.md), or [中文文档](../README.zh-CN.md) for the
 recommended QUASAR NVFP4 text profile, local two-V100 measurements, historical llama.cpp
 comparison, CUDA 12.8 build and API launch. Other hardware and experiments have separate guides.
 

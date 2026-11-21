@@ -97,7 +97,33 @@ Workload: 4 essay prompts, `max_tokens=256`, `temperature=0.0`, thinking ON, 16-
 | Workload | Normal | DSpark-2 | DSpark-3 | DSpark-7 |
 |---|---:|---:|---:|---:|
 | Python dataclass refactor (256 tok) | 106.08 tok/s | 156.86 tok/s (`2.50` tok/rnd, 75.0%) | **165.35 tok/s** (`2.99` tok/rnd, 66.3%) | 147.60 tok/s (`3.81` tok/rnd, 40.1%) |
-| 4,184-tok needle retrieval (`--max-context 8192`) | 83.00 tok/s (prefill 705.5) | — | **139.77 tok/s** (prefill 860.4) | — |
+| 4,184-tok needle retrieval (`--max-context 8192`) | 83.00 tok/s (single-shot CLI) | — | **139.77 tok/s** (single-shot CLI) | — |
+
+### Cold prefill throughput & TTFT (512–65,536 tokens, C=1)
+
+Measured via `ninfer-serve --tp 2 --devices 0,1 --max-concurrency 1 --max-context 70000 --no-thinking --greedy --request-log-jsonl`
+after one 1,024-token warmup request (`max_tokens=1`, verified `prefix_cache_hit_tokens = 0` on every run).
+Values report mean engine `prefill tok/s` (`computed_prefill_tokens / timings_seconds.prefill`) and mean
+server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–65,536` tokens):
+
+| Prompt tokens | Normal (`chunk=1024`) | Normal (`chunk=2048`) | DSpark-3 (`chunk=1024`) |
+|---:|---:|---:|---:|
+| 512 | **1,033.73 tok/s** (0.495 s / TTFT 0.498 s) | — | 1,001.50 tok/s (0.511 s / TTFT 0.516 s) |
+| 1,023 | **1,014.45 tok/s** (1.008 s / TTFT 1.012 s) | — | 982.23 tok/s (1.042 s / TTFT 1.049 s) |
+| 2,048 | **940.83 tok/s** (2.177 s / TTFT 2.184 s) | 928.26 tok/s (2.206 s / TTFT 2.216 s) | 907.30 tok/s (2.257 s / TTFT 2.268 s) |
+| 4,096 | **882.80 tok/s** (4.640 s / TTFT 4.653 s) | 876.14 tok/s (4.675 s / TTFT 4.701 s) | 850.95 tok/s (4.814 s / TTFT 4.834 s) |
+| 8,192 | **810.48 tok/s** (10.108 s / TTFT 10.134 s) | 809.25 tok/s (10.123 s / TTFT 10.179 s) | 784.61 tok/s (10.441 s / TTFT 10.471 s) |
+| 16,385 | 703.48 tok/s (23.292 s / TTFT 23.350 s) | **709.14 tok/s** (23.106 s / TTFT 23.178 s) | 684.23 tok/s (23.947 s / TTFT 24.005 s) |
+| 32,768 | 566.44 tok/s (57.850 s / TTFT 57.994 s) | **576.55 tok/s** (56.835 s / TTFT 56.955 s) | 554.22 tok/s (59.124 s / TTFT 59.217 s) |
+| 65,536 | 406.50 tok/s (161.221 s / TTFT 161.473 s) | **417.78 tok/s** (156.868 s / TTFT 157.096 s) | 401.16 tok/s (163.365 s / TTFT 163.620 s) |
+
+- Default `--prefill-chunk 1024` is fastest at 512–8,192 tokens (**810–1,034 tok/s**); `--prefill-chunk 2048`
+  pulls ahead at ≥16K (**709.1 / 576.6 / 417.8 tok/s** at 16K / 32K / 64K, up to +2.8% faster at 64K).
+- Enabling DSpark-3 (`--spec mtp --draft-tokens 3`) adds only **1.3%–3.6%** prefill overhead for hidden-state
+  capture and 3-layer drafter KV population across the full 512–65,536 token sweep.
+- Run-to-run variance across repetitions was under ±0.5% at every length; the smooth decline from 1,034 to
+  407–418 tok/s reflects quadratic BF16 global attention over the 12 global logical layers (the other 36
+  logical layers stay bounded to SWA-1024).
 
 ## Key Volta `sm_70` optimizations
 

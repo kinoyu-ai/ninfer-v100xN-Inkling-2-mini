@@ -1,6 +1,6 @@
 # ninfer-v100xN
 
-[中文](README.zh-CN.md) · [Inkling-2-Mini](docs/inkling2-mini.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
+[日本語](README.ja.md) · [中文](README.zh-CN.md) · [Inkling-2-Mini](docs/inkling2-mini.md) · [GUI](docs/gui.md) · [TUI](docs/tui.md) · [Docker](docs/docker.md) · [Detailed measurements](docs/performance.md) · [HTTP API](docs/serving.md)
 
 ## Fork addition: native lossless Inkling-2-Mini (`inkling2-mini/nvfp4-mxfp8`)
 
@@ -20,6 +20,8 @@ Measured on **2 × Tesla V100-SXM2 16 GB** (PCIe P2P, **150 W** power cap, CUDA 
 | Essay 256 tok, C=8 Normal (agg) | **313.2 tok/s** | — | — |
 | Code refactor 256 tok, C=1 Normal / DSpark-3 | 106.1 / **165.4 tok/s** | — | — |
 | 4,184-tok needle retrieval, C=1 Normal / DSpark-3 | 83.0 / **139.8 tok/s** | — | — |
+| Cold prefill (512 / 4K / 16K / 64K tok), Normal (`chunk=1024`, `2048` at ≥16K) | **1,033.7** / **882.8** / **709.1** / **417.8 tok/s** | — | — |
+| Cold prefill (512 / 4K / 16K / 64K tok), DSpark-3 (`chunk=1024`) | 1,001.5 / 851.0 / 684.2 / 401.2 tok/s | — | — |
 
 Verified with **76/76** FP64/TP2 operator unit tests, **32/32** exact token parity against the
 PyTorch reference across Normal (Graph/Eager) and DSpark-2/3/7, HF `AutoTokenizer` parity,
