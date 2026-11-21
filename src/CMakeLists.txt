@@ -318,7 +318,13 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
     ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_qpn_split.cu
     ops/launcher/gqa_attention_volta_flash.cu
     ops/launcher/gqa_attention_volta_splitd.cu
-    ops/launcher/vision_attention_volta_flash.cu)
+    ops/launcher/vision_attention_volta_flash.cu
+    ops/inkling2/bf16_linear.cu
+    ops/inkling2/attn_res_control.cu
+    ops/inkling2/sconv.cu
+    ops/inkling2/attention.cu
+    ops/inkling2/sparse_moe.cu
+    ops/inkling2/dspark.cu)
   target_link_libraries(ninfer_ops PRIVATE nvidia::cutlass::cutlass)
   target_compile_options(ninfer_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   set_source_files_properties(
@@ -398,6 +404,7 @@ target_include_directories(ninfer_engine PUBLIC ${PROJECT_SOURCE_DIR}/include)
 add_subdirectory(targets/qwen3_6)
 add_subdirectory(targets/qwen3_6_27b)
 add_subdirectory(targets/qwen3_6_35b_a3b)
+add_subdirectory(targets/inkling2_mini)
 
 target_link_libraries(ninfer_engine
   PRIVATE

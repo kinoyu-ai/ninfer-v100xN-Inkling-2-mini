@@ -64,6 +64,8 @@ NumericFormat: TypeAlias = DirectFormat | QuantFormat | Nvfp4Format | Fp8RowForm
 BF16 = DirectFormat("BF16", 2)
 FP32 = DirectFormat("FP32", 4)
 I32 = DirectFormat("I32", 4)
+U8 = DirectFormat("U8", 1)
+FP8_E4M3FN = DirectFormat("FP8_E4M3FN", 1)
 
 Q4G64_F16S = QuantFormat("Q4G64_F16S", 4, 64, -8, 7)
 Q5G64_F16S = QuantFormat("Q5G64_F16S", 5, 64, -16, 15)
@@ -76,7 +78,7 @@ GGML_K = GgmlKFormat("GGML_K")
 
 
 DIRECT_FORMATS = MappingProxyType(
-    {item.name: item for item in (BF16, FP32, I32)}
+    {item.name: item for item in (BF16, FP32, I32, U8, FP8_E4M3FN)}
 )
 QUANT_FORMATS = MappingProxyType(
     {
@@ -171,6 +173,7 @@ __all__ = [
     "BF16",
     "DIRECT_FORMATS",
     "DirectFormat",
+    "FP8_E4M3FN",
     "FP8_E4M3FN_ROW_BF16S",
     "FP8_E4M3FN_BLOCK128_BF16S",
     "Fp8BlockFormat",

@@ -54,6 +54,12 @@ ninfer_add_op_test(ninfer_ggml_k_test
   SOURCES ops/test_ggml_k.cpp
   LIBRARIES ninfer_ops)
 
+if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
+  ninfer_add_op_test(ninfer_inkling2_ops_test
+    SOURCES ops/test_inkling2_ops.cpp
+    LIBRARIES ninfer_ops)
+endif()
+
 function(ninfer_add_fused_linear_test name source common)
   ninfer_add_op_test(${name}
     SOURCES ${source} ${common}

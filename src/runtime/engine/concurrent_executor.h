@@ -8,7 +8,6 @@
 #include "runtime/engine/admission_policy.h"
 #include "runtime/engine/request_memory.h"
 #include "runtime/generation/generation_budget.h"
-#include "targets/qwen3_6/export/ninfer/targets/qwen3_6/frontend.h"
 
 #include <algorithm>
 #include <array>
@@ -36,11 +35,17 @@ class ConcurrentExecutor {
     struct Request;
 
 public:
-    using Package  = typename Instance::Package;
-    using Program  = typename Package::Program;
-    using BasePlan = typename Package::RequestBasePlan;
-    using Plan     = typename Package::RequestPlan;
-    using Clock    = std::chrono::steady_clock;
+    using Package        = typename Instance::Package;
+    using Program        = typename Package::Program;
+    using BasePlan       = typename Package::RequestBasePlan;
+    using Plan           = typename Package::RequestPlan;
+    using Frontend       = std::remove_cvref_t<decltype(std::declval<Instance&>().loaded->frontend)>;
+    using PreparedPrompt = decltype(std::declval<const Frontend&>().prepare_tokens(std::vector<TokenId>{}));
+    using OutputSession  = decltype(std::declval<const Frontend&>().make_output_session(
+        std::declval<const PreparedPrompt&>(), std::declval<const StopPolicy&>(),
+        std::declval<const OutputOptions&>()));
+    using PublishedOutput = decltype(std::declval<OutputSession&>().commit_preview());
+    using Clock           = std::chrono::steady_clock;
 
     ConcurrentExecutor(Instance& instance, const EngineOptions& options, const DeviceContext& device)
         : instance_(instance), device_(device.device), max_concurrency_(options.max_concurrency),
@@ -126,7 +131,7 @@ public:
         friend class ConcurrentExecutor;
     };
 
-    Submission submit(targets::qwen3_6::PreparedPrompt prompt, PromptSummary prompt_summary,
+    Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary,
                       double prepare_seconds, ResolvedRequestOptions options,
                       const PreparationControl& preparation = {}) {
         const Clock::time_point submitted = Clock::now();
@@ -320,8 +325,8 @@ private:
     }
 
     struct Request {
-        Request(std::uint64_t request_identity, targets::qwen3_6::PreparedPrompt input,
-                targets::qwen3_6::OutputSession output_session, PromptSummary summary,
+        Request(std::uint64_t request_identity, PreparedPrompt input,
+                OutputSession output_session, PromptSummary summary,
                 double frontend_seconds, ResolvedRequestOptions request_options,
                 Clock::time_point limit, Clock::time_point submit_time)
             : id(request_identity), prompt(std::move(input)), output(std::move(output_session)),
@@ -329,8 +334,8 @@ private:
               options(std::move(request_options)), deadline(limit), submitted(submit_time) {}
 
         const std::uint64_t id;
-        targets::qwen3_6::PreparedPrompt prompt;
-        targets::qwen3_6::OutputSession output;
+        PreparedPrompt prompt;
+        OutputSession output;
         PromptSummary prompt_summary;
         double prepare_seconds = 0.0;
         double host_vision_seconds = 0.0;
@@ -402,7 +407,7 @@ private:
     };
 
     void append_output(const std::shared_ptr<Request>& request,
-                       targets::qwen3_6::PublishedOutput output) {
+                       PublishedOutput output) {
         if (output.empty()) { return; }
         {
             std::lock_guard lock(request->mutex);

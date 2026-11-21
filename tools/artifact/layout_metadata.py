@@ -90,7 +90,7 @@ class Fp8BlockGeometry:
 
 
 CONTIGUOUS_LE_V1 = Layout(
-    "contiguous-le-v1", 256, frozenset(("BF16", "FP32", "I32"))
+    "contiguous-le-v1", 256, frozenset(("BF16", "FP32", "I32", "U8", "FP8_E4M3FN"))
 )
 ROW_SPLIT_K128_V1 = Layout(
     "row-split-k128-v1",

@@ -277,6 +277,23 @@ Qwen3_6_35BA3BInstance::Qwen3_6_35BA3BInstance(std::unique_ptr<LoadedQwen3_6_35B
 
 Qwen3_6_35BA3BInstance::~Qwen3_6_35BA3BInstance() = default;
 
+LoadedInkling2Mini::LoadedInkling2Mini(std::unique_ptr<Inkling2Mini::LoadedModel> stable_model,
+                                       const EngineOptions& options)
+    : model(std::move(stable_model)), frontend(Inkling2Mini::make_frontend(*model, options)) {}
+
+LoadedInkling2Mini::~LoadedInkling2Mini() = default;
+
+Inkling2MiniInstance::Inkling2MiniInstance(std::unique_ptr<LoadedInkling2Mini> stable_loaded,
+                                           runtime::KvCapacityResolution resolution,
+                                           Inkling2Mini::SequencePlan sequence_plan,
+                                           ExecutionContext& execution)
+    : loaded(std::move(stable_loaded)), kv_capacity_resolution(resolution),
+      request_memory(execution.primary(), sequence_plan.request_transient_capacity_bytes()),
+      capacity(sequence_plan.capacity()),
+      program(Inkling2Mini::create_program(*loaded->model, std::move(sequence_plan), execution)) {}
+
+Inkling2MiniInstance::~Inkling2MiniInstance() = default;
+
 ConstructedTarget construct_target(const EngineOptions& options, ExecutionContext& execution,
                                   std::shared_ptr<const std::vector<std::byte>> image) {
     validate_options(options);
@@ -299,6 +316,10 @@ ConstructedTarget construct_target(const EngineOptions& options, ExecutionContex
     if (identity.model_id == Qwen3_6_35BA3B::model_id) {
         return construct_registered<Qwen3_6_35BA3B, LoadedQwen3_6_35BA3B, Qwen3_6_35BA3BInstance>(
             options, execution, reader, load_start, Qwen3_6_35BA3B::target_key);
+    }
+    if (identity.model_id == Inkling2Mini::model_id) {
+        return construct_registered<Inkling2Mini, LoadedInkling2Mini, Inkling2MiniInstance>(
+            options, execution, reader, load_start, Inkling2Mini::target_key);
     }
     throw std::runtime_error("artifact identity '" + identity.model_id + "/" + identity.weights_id +
                              "' has no registered target for this device");

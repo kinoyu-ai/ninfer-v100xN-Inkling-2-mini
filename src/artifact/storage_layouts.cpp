@@ -59,13 +59,16 @@ QuantGeometry quant_geometry(NumericFormat format) {
 
 std::uint64_t direct_word_bytes(NumericFormat format) {
     switch (format) {
+    case NumericFormat::U8:
+    case NumericFormat::FP8_E4M3FN:
+        return 1;
     case NumericFormat::BF16:
         return 2;
     case NumericFormat::FP32:
     case NumericFormat::I32:
         return 4;
     default:
-        throw ArtifactError("contiguous-le-v1 requires BF16, FP32, or I32");
+        throw ArtifactError("contiguous-le-v1 requires BF16, FP32, I32, U8, or FP8_E4M3FN");
     }
 }
 
@@ -119,6 +122,10 @@ std::string_view format_name(NumericFormat format) noexcept {
         return "FP32";
     case NumericFormat::I32:
         return "I32";
+    case NumericFormat::U8:
+        return "U8";
+    case NumericFormat::FP8_E4M3FN:
+        return "FP8_E4M3FN";
     case NumericFormat::Q4G64_F16S:
         return "Q4G64_F16S";
     case NumericFormat::Q5G64_F16S:

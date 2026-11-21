@@ -16,6 +16,8 @@ StorageLayout storage_layout_for(NumericFormat format) {
     case NumericFormat::BF16:
     case NumericFormat::FP32:
     case NumericFormat::I32:
+    case NumericFormat::U8:
+    case NumericFormat::FP8_E4M3FN:
         return StorageLayout::ContiguousLeV1;
     case NumericFormat::Q4G64_F16S:
     case NumericFormat::Q5G64_F16S:
@@ -42,6 +44,10 @@ QType qtype_for(NumericFormat format) {
         return QType::FP32_CTRL;
     case NumericFormat::I32:
         return QType::I32_CTRL;
+    case NumericFormat::U8:
+        return QType::U8_CTRL;
+    case NumericFormat::FP8_E4M3FN:
+        return QType::FP8_E4M3FN_CTRL;
     case NumericFormat::Q4G64_F16S:
         return QType::Q4G64_F16S;
     case NumericFormat::Q5G64_F16S:
@@ -70,6 +76,10 @@ DType dtype_for(NumericFormat format) {
         return DType::FP32;
     case NumericFormat::I32:
         return DType::I32;
+    case NumericFormat::U8:
+        return DType::U8;
+    case NumericFormat::FP8_E4M3FN:
+        return DType::FP8_E4M3FN;
     default:
         throw std::logic_error("quantized format has no direct dtype");
     }

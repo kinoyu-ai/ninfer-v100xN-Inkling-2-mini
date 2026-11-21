@@ -7,6 +7,7 @@
 #include "runtime/engine/concurrent_executor.h"
 #include "targets/registry.h"
 
+#include <ninfer/targets/inkling2_mini/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 
 #include <stdexcept>
@@ -111,15 +112,19 @@ std::string context_capacity_error(std::uint32_t prompt_tokens, std::uint32_t ma
 
 class PreparedPrompt::Impl {
 public:
+    using Variant =
+        std::variant<targets::qwen3_6::PreparedPrompt, targets::inkling2_mini::PreparedPrompt>;
+
+    template <class P>
     Impl(PromptSummary prompt_summary, PromptPreparationStats preparation, SamplingMode mode,
-         targets::qwen3_6::PreparedPrompt prepared)
+         P prepared)
         : summary(std::move(prompt_summary)), prepare(std::move(preparation)), sampling_mode(mode),
           value(std::move(prepared)) {}
 
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    targets::qwen3_6::PreparedPrompt value;
+    Variant value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -143,7 +148,16 @@ PreparedPrompt::operator bool() const noexcept { return impl_ != nullptr; }
 
 std::vector<TokenId> PreparedPrompt::debug_token_ids() const {
     if (impl_ == nullptr) { throw std::logic_error("PreparedPrompt is empty"); }
-    return targets::qwen3_6::PreparedPromptAccess::view(impl_->value).token_ids;
+    return std::visit(
+        [](const auto& prepared) -> std::vector<TokenId> {
+            using T = std::remove_cvref_t<decltype(prepared)>;
+            if constexpr (std::is_same_v<T, targets::qwen3_6::PreparedPrompt>) {
+                return targets::qwen3_6::PreparedPromptAccess::view(prepared).token_ids;
+            } else {
+                return targets::inkling2_mini::PreparedPromptAccess::view(prepared).token_ids;
+            }
+        },
+        impl_->value);
 }
 
 class GenerationHandle::Impl {
@@ -218,10 +232,11 @@ std::uint64_t ModelMemory::bytes() const noexcept {
 
 class Engine::Impl {
 public:
-    using Executor27 = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
-    using Executor35 = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
-    using Executor =
-        std::variant<std::monostate, std::unique_ptr<Executor27>, std::unique_ptr<Executor35>>;
+    using Executor27       = runtime::ConcurrentExecutor<targets::Qwen3_6_27BInstance>;
+    using Executor35       = runtime::ConcurrentExecutor<targets::Qwen3_6_35BA3BInstance>;
+    using ExecutorInkling2 = runtime::ConcurrentExecutor<targets::Inkling2MiniInstance>;
+    using Executor = std::variant<std::monostate, std::unique_ptr<Executor27>,
+                                  std::unique_ptr<Executor35>, std::unique_ptr<ExecutorInkling2>>;
 
     explicit Impl(EngineOptions engine_options,
                   std::shared_ptr<const std::vector<std::byte>> image = {})
@@ -238,8 +253,10 @@ public:
                     typename std::remove_reference_t<decltype(target_ptr)>::element_type;
                 if constexpr (std::is_same_v<Instance, targets::Qwen3_6_27BInstance>) {
                     return std::make_unique<Executor27>(*target_ptr, options, device);
-                } else {
+                } else if constexpr (std::is_same_v<Instance, targets::Qwen3_6_35BA3BInstance>) {
                     return std::make_unique<Executor35>(*target_ptr, options, device);
+                } else {
+                    return std::make_unique<ExecutorInkling2>(*target_ptr, options, device);
                 }
             },
             active);
@@ -401,7 +418,13 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<Executor, std::monostate>) {
                 throw std::logic_error("concurrent Engine executor is unavailable");
             } else {
-                auto submission = executor->submit(std::move(prompt.impl_->value), prompt_summary,
+                using ExpectedPrompt = typename Executor::element_type::PreparedPrompt;
+                auto* typed_prompt   = std::get_if<ExpectedPrompt>(&prompt.impl_->value);
+                if (typed_prompt == nullptr) {
+                    throw std::invalid_argument(
+                        "PreparedPrompt does not belong to the active Engine target");
+                }
+                auto submission = executor->submit(std::move(*typed_prompt), prompt_summary,
                                                    prepare_seconds, std::move(resolved_options),
                                                    control);
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
