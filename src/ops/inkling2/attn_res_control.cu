@@ -35,22 +35,6 @@ __device__ __forceinline__ float block_sum_256(float v) {
     return smem[0];
 }
 
-__device__ __forceinline__ float4 load_bf16x4(const __nv_bfloat16* p) {
-    const uint2 raw = __ldg(reinterpret_cast<const uint2*>(p));
-    const auto* b   = reinterpret_cast<const __nv_bfloat162*>(&raw);
-    const float2 f0 = __bfloat1622float2(b[0]);
-    const float2 f1 = __bfloat1622float2(b[1]);
-    return make_float4(f0.x, f0.y, f1.x, f1.y);
-}
-
-__device__ __forceinline__ void store_bf16x4(__nv_bfloat16* p, float a, float b, float c, float d) {
-    uint2 out;
-    auto* dst = reinterpret_cast<__nv_bfloat162*>(&out);
-    dst[0]    = __floats2bfloat162_rn(a, b);
-    dst[1]    = __floats2bfloat162_rn(c, d);
-    *reinterpret_cast<uint2*>(p) = out;
-}
-
 __device__ __forceinline__ void load_bf16x8(const __nv_bfloat16* p, float (&out)[8]) {
     const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
     const auto* b   = reinterpret_cast<const __nv_bfloat162*>(&raw);
@@ -335,6 +319,369 @@ __global__ __launch_bounds__(288, 2) void inkling2_attn_res_mix_pair_h2304_kerne
     }
 }
 
+// ============================================================================
+// 3b. FUSED AttnRes Mix + Loop Control Prep (eliminates 48 prep launches + HBM re-reads!)
+//     Exact BF16 rounding boundary before computing inv_rms for z = [norm(cur), norm(msg)]!
+// ============================================================================
+
+template <int S>
+__global__ __launch_bounds__(288, 2) void attn_res_mix_and_prep_h2304_kernel(
+    AttnResArgs args, const float* __restrict__ query, const __nv_bfloat16* __restrict__ msg,
+    __nv_bfloat16* __restrict__ out_mixed, __nv_bfloat16* __restrict__ out_z, int tokens,
+    float eps) {
+    constexpr int kWarps = 9;
+    __shared__ float s_red[5][kWarps];
+    __shared__ float s_scalar[5];
+
+    const int row = blockIdx.x;
+    if (row >= tokens) { return; }
+    const int tid  = threadIdx.x; // 0..287
+    const int warp = tid >> 5;    // 0..8
+    const int lane = tid & 31;
+    const int idx  = tid * 8;
+
+    float v_reg[S][8];
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        load_bf16x8(args.sources[s] + static_cast<std::int64_t>(row) * 2304 + idx, v_reg[s]);
+        float sq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sq = fmaf(v_reg[s][j], v_reg[s][j], sq); }
+        sq = warp_sum(sq);
+        if (lane == 0) { s_red[s][warp] = sq; }
+    }
+    __syncthreads();
+
+    if (warp < S) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+        if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+    }
+    __syncthreads();
+
+    const float* qp = query + idx;
+    const float4 q0 = __ldg(reinterpret_cast<const float4*>(qp));
+    const float4 q1 = __ldg(reinterpret_cast<const float4*>(qp + 4));
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        const float inv = s_scalar[s];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { v_reg[s][j] *= inv; }
+        float dot = fmaf(q0.x, v_reg[s][0],
+                         fmaf(q0.y, v_reg[s][1], fmaf(q0.z, v_reg[s][2], q0.w * v_reg[s][3])));
+        dot = fmaf(q1.x, v_reg[s][4],
+                   fmaf(q1.y, v_reg[s][5], fmaf(q1.z, v_reg[s][6], fmaf(q1.w, v_reg[s][7], dot))));
+        dot = warp_sum(dot);
+        if (lane == 0) { s_red[s][warp] = dot; }
+    }
+    __syncthreads();
+
+    constexpr float kScale = 0.020833333333333332f;
+    if (warp < S) {
+        const float dot = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+        if (lane == 0) { s_scalar[warp] = dot * kScale; }
+    }
+    __syncthreads();
+
+    float mx = -1e30f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) { mx = fmaxf(mx, s_scalar[s]); }
+    float probs[S];
+    float den = 0.0f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        const float p = expf(s_scalar[s] - mx);
+        probs[s]      = p;
+        den += p;
+    }
+    const float inv_d = 1.0f / den;
+#pragma unroll
+    for (int s = 0; s < S; ++s) { probs[s] *= inv_d; }
+
+    // Mix cur, store BF16 to out_mixed, and round to BF16 in registers for bit-identical prep!
+    float cur_v[8];
+    uint4 cur_raw;
+    auto* cur_b = reinterpret_cast<__nv_bfloat162*>(&cur_raw);
+    float sq_c  = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float a = 0.0f, b = 0.0f;
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            a = fmaf(probs[s], v_reg[s][2 * j], a);
+            b = fmaf(probs[s], v_reg[s][2 * j + 1], b);
+        }
+        cur_b[j]           = __floats2bfloat162_rn(a, b);
+        const float2 bf    = __bfloat1622float2(cur_b[j]);
+        cur_v[2 * j]       = bf.x;
+        cur_v[2 * j + 1]   = bf.y;
+        sq_c               = fmaf(bf.x, bf.x, fmaf(bf.y, bf.y, sq_c));
+    }
+    *reinterpret_cast<uint4*>(out_mixed + static_cast<std::int64_t>(row) * 2304 + idx) = cur_raw;
+
+    // Load msg3 and compute BOTH sq_c and sq_m in ONE barrier!
+    float msg_v[8];
+    load_bf16x8(msg + static_cast<std::int64_t>(row) * 2304 + idx, msg_v);
+    float sq_m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { sq_m = fmaf(msg_v[j], msg_v[j], sq_m); }
+
+    sq_c = warp_sum(sq_c);
+    sq_m = warp_sum(sq_m);
+    if (lane == 0) {
+        s_red[0][warp] = sq_c;
+        s_red[1][warp] = sq_m;
+    }
+    __syncthreads();
+    if (warp < 2) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+        if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+    }
+    __syncthreads();
+
+    const float ic = s_scalar[0];
+    const float im = s_scalar[1];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        cur_v[j] *= ic;
+        msg_v[j] *= im;
+    }
+    __nv_bfloat16* zrow = out_z + static_cast<std::int64_t>(row) * 4608;
+    store_bf16x8(zrow + idx, cur_v);
+    store_bf16x8(zrow + 2304 + idx, msg_v);
+}
+
+// Paired Cross-Pass AttnRes + QKV Loop Control Prep in ONE launch (grid = (tokens, 2), 288 threads):
+//   blockIdx.y == 0: computes msgs[0..3], writes msgs[0..3], writes norm(msgs[0..2]) -> z_all[c, row, 2304..4607]
+//   blockIdx.y == 1: computes cur_mix[0..Q1-1], writes cur_outs, writes norm(cur_mix) -> z_all[c, row, 0..2303]
+template <int S1, int Q1>
+__global__ __launch_bounds__(288, 2) void attn_res_mix_pair_and_prep_qkv_h2304_kernel(
+    AttnResArgs a0, const float* __restrict__ q0, AttnResArgs a1, const float* __restrict__ q1,
+    __nv_bfloat16* __restrict__ z_all, int tokens, float eps) {
+    constexpr int kWarps = 9;
+    __shared__ float s_red[16][kWarps];
+    __shared__ float s_scalar[16];
+
+    const int row = blockIdx.x;
+    if (row >= tokens) { return; }
+    const int tid  = threadIdx.x; // 0..287
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    const int idx  = tid * 8;
+    constexpr float kScale = 0.020833333333333332f;
+
+    if (blockIdx.y == 0) {
+        // S = 2, Q = 4: bank_srcs -> msgs[0..3] AND z_all[c=0..2, row, 2304..4607]
+        float v_reg[2][8];
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            load_bf16x8(a0.sources[s] + static_cast<std::int64_t>(row) * 2304 + idx, v_reg[s]);
+            float sq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { sq = fmaf(v_reg[s][j], v_reg[s][j], sq); }
+            sq = warp_sum(sq);
+            if (lane == 0) { s_red[s][warp] = sq; }
+        }
+        __syncthreads();
+        if (warp < 2) {
+            const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+            if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int s = 0; s < 2; ++s) {
+            const float inv = s_scalar[s];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { v_reg[s][j] *= inv; }
+        }
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const float* qp = q0 + static_cast<std::int64_t>(q) * 2304 + idx;
+            const float4 qv0 = __ldg(reinterpret_cast<const float4*>(qp));
+            const float4 qv1 = __ldg(reinterpret_cast<const float4*>(qp + 4));
+#pragma unroll
+            for (int s = 0; s < 2; ++s) {
+                float dot = fmaf(qv0.x, v_reg[s][0],
+                                 fmaf(qv0.y, v_reg[s][1], fmaf(qv0.z, v_reg[s][2], qv0.w * v_reg[s][3])));
+                dot = fmaf(qv1.x, v_reg[s][4],
+                           fmaf(qv1.y, v_reg[s][5], fmaf(qv1.z, v_reg[s][6], fmaf(qv1.w, v_reg[s][7], dot))));
+                dot = warp_sum(dot);
+                if (lane == 0) { s_red[q * 2 + s][warp] = dot; }
+            }
+        }
+        __syncthreads();
+        if (warp < 8) {
+            const float dot = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+            if (lane == 0) { s_scalar[warp] = dot * kScale; }
+        }
+        __syncthreads();
+
+        float m_reg[3][8];
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const float s0v = s_scalar[q * 2 + 0];
+            const float s1v = s_scalar[q * 2 + 1];
+            const float mx  = fmaxf(s0v, s1v);
+            const float e0  = expf(s0v - mx);
+            const float e1  = expf(s1v - mx);
+            const float inv = 1.0f / (e0 + e1);
+            const float p0  = e0 * inv;
+            const float p1  = e1 * inv;
+
+            uint4 raw;
+            auto* b = reinterpret_cast<__nv_bfloat162*>(&raw);
+            float sq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const float x0 = fmaf(p0, v_reg[0][2 * j], p1 * v_reg[1][2 * j]);
+                const float x1 = fmaf(p0, v_reg[0][2 * j + 1], p1 * v_reg[1][2 * j + 1]);
+                b[j]           = __floats2bfloat162_rn(x0, x1);
+                if (q < 3) {
+                    const float2 bf     = __bfloat1622float2(b[j]);
+                    m_reg[q][2 * j]     = bf.x;
+                    m_reg[q][2 * j + 1] = bf.y;
+                    sq                  = fmaf(bf.x, bf.x, fmaf(bf.y, bf.y, sq));
+                }
+            }
+            *reinterpret_cast<uint4*>(a0.outs[q] + static_cast<std::int64_t>(row) * 2304 + idx) = raw;
+            if (q < 3) {
+                sq = warp_sum(sq);
+                if (lane == 0) { s_red[q][warp] = sq; }
+            }
+        }
+        __syncthreads();
+        if (warp < 3) {
+            const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+            if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            const float im = s_scalar[c];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { m_reg[c][j] *= im; }
+            __nv_bfloat16* zrow = z_all + (static_cast<std::int64_t>(c) * tokens + row) * 4608;
+            store_bf16x8(zrow + 2304 + idx, m_reg[c]);
+        }
+    } else {
+        // S = S1, Q = Q1 (1 or 3): cur_srcs -> cur_outs[0..Q1-1] AND z_all[c=0..2, row, 0..2303]
+        float v_reg[S1][8];
+#pragma unroll
+        for (int s = 0; s < S1; ++s) {
+            load_bf16x8(a1.sources[s] + static_cast<std::int64_t>(row) * 2304 + idx, v_reg[s]);
+            float sq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { sq = fmaf(v_reg[s][j], v_reg[s][j], sq); }
+            sq = warp_sum(sq);
+            if (lane == 0) { s_red[s][warp] = sq; }
+        }
+        __syncthreads();
+        if (warp < S1) {
+            const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+            if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int s = 0; s < S1; ++s) {
+            const float inv = s_scalar[s];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { v_reg[s][j] *= inv; }
+        }
+#pragma unroll
+        for (int q = 0; q < Q1; ++q) {
+            const float* qp  = q1 + static_cast<std::int64_t>(q) * 2304 + idx;
+            const float4 qv0 = __ldg(reinterpret_cast<const float4*>(qp));
+            const float4 qv1 = __ldg(reinterpret_cast<const float4*>(qp + 4));
+#pragma unroll
+            for (int s = 0; s < S1; ++s) {
+                float dot = fmaf(qv0.x, v_reg[s][0],
+                                 fmaf(qv0.y, v_reg[s][1], fmaf(qv0.z, v_reg[s][2], qv0.w * v_reg[s][3])));
+                dot = fmaf(qv1.x, v_reg[s][4],
+                           fmaf(qv1.y, v_reg[s][5], fmaf(qv1.z, v_reg[s][6], fmaf(qv1.w, v_reg[s][7], dot))));
+                dot = warp_sum(dot);
+                if (lane == 0) { s_red[q * S1 + s][warp] = dot; }
+            }
+        }
+        __syncthreads();
+        for (int qs = warp; qs < Q1 * S1; qs += kWarps) {
+            const float dot = warp_sum((lane < kWarps) ? s_red[qs][lane] : 0.0f);
+            if (lane == 0) { s_scalar[qs] = dot * kScale; }
+        }
+        __syncthreads();
+
+        float c_reg[Q1][8];
+#pragma unroll
+        for (int q = 0; q < Q1; ++q) {
+            float mx = -1e30f;
+#pragma unroll
+            for (int s = 0; s < S1; ++s) { mx = fmaxf(mx, s_scalar[q * S1 + s]); }
+            float probs[S1];
+            float den = 0.0f;
+#pragma unroll
+            for (int s = 0; s < S1; ++s) {
+                const float p = expf(s_scalar[q * S1 + s] - mx);
+                probs[s]      = p;
+                den += p;
+            }
+            const float inv_d = 1.0f / den;
+#pragma unroll
+            for (int s = 0; s < S1; ++s) { probs[s] *= inv_d; }
+
+            uint4 raw;
+            auto* b  = reinterpret_cast<__nv_bfloat162*>(&raw);
+            float sq = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float x0 = 0.0f, x1 = 0.0f;
+#pragma unroll
+                for (int s = 0; s < S1; ++s) {
+                    x0 = fmaf(probs[s], v_reg[s][2 * j], x0);
+                    x1 = fmaf(probs[s], v_reg[s][2 * j + 1], x1);
+                }
+                b[j]                = __floats2bfloat162_rn(x0, x1);
+                const float2 bf     = __bfloat1622float2(b[j]);
+                c_reg[q][2 * j]     = bf.x;
+                c_reg[q][2 * j + 1] = bf.y;
+                sq                  = fmaf(bf.x, bf.x, fmaf(bf.y, bf.y, sq));
+            }
+            *reinterpret_cast<uint4*>(a1.outs[q] + static_cast<std::int64_t>(row) * 2304 + idx) = raw;
+            sq = warp_sum(sq);
+            if (lane == 0) { s_red[q][warp] = sq; }
+        }
+        __syncthreads();
+        if (warp < Q1) {
+            const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+            if (lane == 0) { s_scalar[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+        }
+        __syncthreads();
+
+        if constexpr (Q1 == 1) {
+            const float ic = s_scalar[0];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) { c_reg[0][j] *= ic; }
+            uint4 zpack;
+            auto* zb = reinterpret_cast<__nv_bfloat162*>(&zpack);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                zb[j] = __floats2bfloat162_rn(c_reg[0][2 * j], c_reg[0][2 * j + 1]);
+            }
+#pragma unroll
+            for (int c = 0; c < 3; ++c) {
+                __nv_bfloat16* zrow = z_all + (static_cast<std::int64_t>(c) * tokens + row) * 4608;
+                *reinterpret_cast<uint4*>(zrow + idx) = zpack;
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < 3; ++c) {
+                const float ic = s_scalar[c];
+#pragma unroll
+                for (int j = 0; j < 8; ++j) { c_reg[c][j] *= ic; }
+                __nv_bfloat16* zrow = z_all + (static_cast<std::int64_t>(c) * tokens + row) * 4608;
+                store_bf16x8(zrow + idx, c_reg[c]);
+            }
+        }
+    }
+}
+
 // Generic fallback for non-2304 hidden sizes (unit tests)
 template <int S, int Q>
 __global__ void inkling2_attn_res_mix_kernel(AttnResArgs args, const float* __restrict__ queries,
@@ -447,43 +794,106 @@ __global__ void loop_control_prep_h2304_kernel(const __nv_bfloat16* __restrict__
                                                const __nv_bfloat16* __restrict__ msg,
                                                __nv_bfloat16* __restrict__ z,
                                                int tokens, float eps) {
-    __shared__ float s_red[2][18];
+    __shared__ float s_red[2][9];
     __shared__ float s_inv[2];
 
-    const int row  = blockIdx.x;
+    const int row = blockIdx.x;
     if (row >= tokens) { return; }
-    const int tid  = threadIdx.x; // 0..575
+    const int tid  = threadIdx.x; // 0..287 (9 warps, 8 BF16/thread)
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int idx  = tid * 4;
+    const int idx  = tid * 8;
 
-    const float4 vc = load_bf16x4(cur + static_cast<std::int64_t>(row) * 2304 + idx);
-    const float4 vm = load_bf16x4(msg + static_cast<std::int64_t>(row) * 2304 + idx);
-    const float sqc = warp_sum(vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w);
-    const float sqm = warp_sum(vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w);
+    float vc[8], vm[8];
+    load_bf16x8(cur + static_cast<std::int64_t>(row) * 2304 + idx, vc);
+    load_bf16x8(msg + static_cast<std::int64_t>(row) * 2304 + idx, vm);
+    float sqc = 0.0f, sqm = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        sqc = fmaf(vc[j], vc[j], sqc);
+        sqm = fmaf(vm[j], vm[j], sqm);
+    }
+    sqc = warp_sum(sqc);
+    sqm = warp_sum(sqm);
     if (lane == 0) {
         s_red[0][warp] = sqc;
         s_red[1][warp] = sqm;
     }
     __syncthreads();
     if (warp < 2) {
-        const float sum = warp_sum((lane < 18) ? s_red[warp][lane] : 0.0f);
+        const float sum = warp_sum((lane < 9) ? s_red[warp][lane] : 0.0f);
         if (lane == 0) { s_inv[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
     }
     __syncthreads();
 
-    const float ic      = s_inv[0];
-    const float im      = s_inv[1];
+    const float ic = s_inv[0];
+    const float im = s_inv[1];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        vc[j] *= ic;
+        vm[j] *= im;
+    }
     __nv_bfloat16* zrow = z + static_cast<std::int64_t>(row) * 4608;
-    store_bf16x4(zrow + idx, vc.x * ic, vc.y * ic, vc.z * ic, vc.w * ic);
-    store_bf16x4(zrow + 2304 + idx, vm.x * im, vm.y * im, vm.z * im, vm.w * im);
+    store_bf16x8(zrow + idx, vc);
+    store_bf16x8(zrow + 2304 + idx, vm);
 }
 
-// Fused Gain/Forget Up-Proj (K=64) + Tanh Blend + Optional Partial SqSum!
+// Fast 2-deep prefetched Single Down-Proj ([4608 -> 64], 64 CTAs x 256 threads = 8 warps/row!)
+template <int ActiveT>
+__global__ __launch_bounds__(256, 4) void loop_control_down_single_pf2_kernel(
+    const __nv_bfloat16* __restrict__ z, const __nv_bfloat16* __restrict__ down_w,
+    __nv_bfloat16* __restrict__ h_out) {
+    __shared__ float smem[ActiveT][8];
+    const int row  = blockIdx.x;  // 0..63
+    const int tid  = threadIdx.x; // 0..255
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+
+    constexpr int kK8  = 4608 / 8; // 576
+    const uint4* wp    = reinterpret_cast<const uint4*>(down_w + static_cast<std::int64_t>(row) * 4608);
+    float acc[ActiveT] = {};
+
+    uint4 w_cur = ld_global_cg_u4(wp + tid);
+    for (int i = tid; i < kK8; i += 256) {
+        uint4 w_nxt{};
+        if (i + 256 < kK8) { w_nxt = ld_global_cg_u4(wp + i + 256); }
+        const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+        const float2 w0 = __bfloat1622float2(wb[0]);
+        const float2 w1 = __bfloat1622float2(wb[1]);
+        const float2 w2 = __bfloat1622float2(wb[2]);
+        const float2 w3 = __bfloat1622float2(wb[3]);
+#pragma unroll
+        for (int ti = 0; ti < ActiveT; ++ti) {
+            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                z + static_cast<std::int64_t>(ti) * 4608) + i);
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            const float2 x0 = __bfloat1622float2(xb[0]);
+            const float2 x1 = __bfloat1622float2(xb[1]);
+            const float2 x2 = __bfloat1622float2(xb[2]);
+            const float2 x3 = __bfloat1622float2(xb[3]);
+            acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+            acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+            acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+            acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
+        }
+        w_cur = w_nxt;
+    }
+
+#pragma unroll
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        const float ws = warp_sum(acc[ti]);
+        if (lane == 0) { smem[ti][warp] = ws; }
+    }
+    __syncthreads();
+    if (warp == 0 && lane < ActiveT) {
+        const float sum = ((smem[lane][0] + smem[lane][1]) + (smem[lane][2] + smem[lane][3])) +
+                          ((smem[lane][4] + smem[lane][5]) + (smem[lane][6] + smem[lane][7]));
+        h_out[static_cast<std::int64_t>(lane) * 64 + row] = __float2bfloat16_rn(sum);
+    }
+}
+
+// Fused Gain/Forget Up-Proj (K=64) + Tanh Blend + partial sq_sum for fast 288t Post-RMSNorm!
 // Processes up to 8 tokens per CTA (grid.x = 72 -> 32 channels/CTA, grid.y = ceil(T/8)).
-// Each group of 4 lanes computes 1 channel i: reads gf_w[i, 0..63] & gf_w[2304+i, 0..63] ONCE
-// (2 uint4 = 16 BF16 per thread -> 100% coalesced 128-byte cache lines!) and contracts with
-// ALL T_blk <= 8 tokens held in shared memory s_h[8][64]!
 template <int MaxTB>
 __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
     const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ gf_w,
@@ -501,7 +911,6 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
     const int t_base = blockIdx.y * MaxTB;
     const int t_cnt  = min(MaxTB, tokens - t_base);
 
-    // Load h[t_base..t_base+t_cnt-1, 0..63] into shared memory
     for (int e = tid; e < t_cnt * 64; e += 128) {
         const int lt = e >> 6;
         const int k  = e & 63;
@@ -509,7 +918,6 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
     }
     __syncthreads();
 
-    // Load 16 gain weights and 16 forget weights ONCE for all t_cnt tokens (streaming .cg)!
     const __nv_bfloat16* gw_ptr = gf_w + static_cast<std::int64_t>(ch) * 64 + sub * 16;
     const __nv_bfloat16* fw_ptr = gf_w + static_cast<std::int64_t>(2304 + ch) * 64 + sub * 16;
     const uint4 gw0             = ld_global_cg_u4(gw_ptr);
@@ -524,17 +932,17 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
     const auto* fb1 = reinterpret_cast<const __nv_bfloat162*>(&fw1);
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
-        const float2 g0  = __bfloat1622float2(gb0[j]);
-        const float2 g1  = __bfloat1622float2(gb1[j]);
-        const float2 f0  = __bfloat1622float2(fb0[j]);
-        const float2 f1  = __bfloat1622float2(fb1[j]);
-        gwf[2 * j]       = g0.x;
-        gwf[2 * j + 1]   = g0.y;
-        gwf[8 + 2 * j]   = g1.x;
+        const float2 g0    = __bfloat1622float2(gb0[j]);
+        const float2 g1    = __bfloat1622float2(gb1[j]);
+        const float2 f0    = __bfloat1622float2(fb0[j]);
+        const float2 f1    = __bfloat1622float2(fb1[j]);
+        gwf[2 * j]         = g0.x;
+        gwf[2 * j + 1]     = g0.y;
+        gwf[8 + 2 * j]     = g1.x;
         gwf[8 + 2 * j + 1] = g1.y;
-        fwf[2 * j]       = f0.x;
-        fwf[2 * j + 1]   = f0.y;
-        fwf[8 + 2 * j]   = f1.x;
+        fwf[2 * j]         = f0.x;
+        fwf[2 * j + 1]     = f0.y;
+        fwf[8 + 2 * j]     = f1.x;
         fwf[8 + 2 * j + 1] = f1.y;
     }
 
@@ -551,7 +959,6 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
                 g_acc          = fmaf(gwf[j], hv, g_acc);
                 f_acc          = fmaf(fwf[j], hv, f_acc);
             }
-            // Reduce across the 4 threads owning this channel
             g_acc += __shfl_xor_sync(0xFFFFFFFFu, g_acc, 1, 4);
             g_acc += __shfl_xor_sync(0xFFFFFFFFu, g_acc, 2, 4);
             f_acc += __shfl_xor_sync(0xFFFFFFFFu, f_acc, 1, 4);
@@ -575,13 +982,13 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_k64_kernel(
     if (partial_sq != nullptr) {
         __syncthreads();
         if (tid < t_cnt) {
-            const float tot = s_sq[tid][0] + s_sq[tid][1] + s_sq[tid][2] + s_sq[tid][3];
+            const float tot = (s_sq[tid][0] + s_sq[tid][1]) + (s_sq[tid][2] + s_sq[tid][3]);
             partial_sq[static_cast<std::int64_t>(t_base + tid) * 72 + blockIdx.x] = tot;
         }
     }
 }
 
-// Fast post-RMSNorm finish using the 72 precomputed partial sq sums (<<<T, 576>>>)
+// Fast post-RMSNorm finish using the 72 precomputed partial sq sums (<<<T, 288>>> uint4, 9 warps!)
 __global__ void loop_control_post_norm_h2304_kernel(__nv_bfloat16* __restrict__ out,
                                                     const __nv_bfloat16* __restrict__ norm_w,
                                                     const float* __restrict__ partial_sq,
@@ -589,9 +996,9 @@ __global__ void loop_control_post_norm_h2304_kernel(__nv_bfloat16* __restrict__ 
     __shared__ float s_w[3];
     __shared__ float s_inv;
 
-    const int row  = blockIdx.x;
+    const int row = blockIdx.x;
     if (row >= tokens) { return; }
-    const int tid  = threadIdx.x; // 0..575
+    const int tid  = threadIdx.x; // 0..287 (9 warps, 8 BF16/thread)
     const int warp = tid >> 5;
     const int lane = tid & 31;
 
@@ -609,107 +1016,119 @@ __global__ void loop_control_post_norm_h2304_kernel(__nv_bfloat16* __restrict__ 
     __syncthreads();
 
     const float inv     = s_inv;
-    const int idx       = tid * 4;
+    const int idx       = tid * 8;
     __nv_bfloat16* orow = out + static_cast<std::int64_t>(row) * 2304 + idx;
-    const float4 v      = load_bf16x4(orow);
-    const float4 nw     = load_bf16x4(norm_w + idx);
-    store_bf16x4(orow, v.x * inv * nw.x, v.y * inv * nw.y, v.z * inv * nw.z, v.w * inv * nw.w);
+    float v[8], nw[8];
+    load_bf16x8(orow, v);
+    load_bf16x8(norm_w + idx, nw);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = v[j] * inv * nw[j]; }
+    store_bf16x8(orow, v);
 }
 
 // ============================================================================
-// 4b. Batched 3-Controller (Q, K, V) Loop Control Kernels (grid.z = 3!)
-//     Runs all 3 pre-attention controllers simultaneously -> 192 fewer launches/step
-//     and 216 CTAs (2.7 full waves on 80 SMs) instead of 3 serial 72-CTA waves!
+// 4b. Batched 3-Controller (Q, K, V) Loop Control Kernels (ZERO stack frame!)
+//     Flat scalar pointers avoid 192B local stack frame; 8-warp 2-deep prefetch in down;
+//     parallel 288t uint4 post-RMSNorm avoids Last-CTA serialization!
 // ============================================================================
 
-struct LoopCtrlQkvArgs {
-    const __nv_bfloat16* cur[3];
-    const __nv_bfloat16* msg[3];
-    const __nv_bfloat16* down[3];
-    const __nv_bfloat16* gf[3];
-    const __nv_bfloat16* norm[3];
-    __nv_bfloat16* out[3];
-};
-
-__global__ void loop_control_prep_qkv_h2304_kernel(LoopCtrlQkvArgs args,
-                                                   __nv_bfloat16* __restrict__ z_all,
-                                                   int tokens, float eps) {
-    __shared__ float s_red[2][18];
+__global__ void loop_control_prep_qkv_h2304_kernel(
+    const __nv_bfloat16* __restrict__ cur0, const __nv_bfloat16* __restrict__ cur1,
+    const __nv_bfloat16* __restrict__ cur2, const __nv_bfloat16* __restrict__ msg0,
+    const __nv_bfloat16* __restrict__ msg1, const __nv_bfloat16* __restrict__ msg2,
+    __nv_bfloat16* __restrict__ z_all, int tokens, float eps) {
+    __shared__ float s_red[2][9];
     __shared__ float s_inv[2];
 
-    const int row  = blockIdx.x;
-    const int c    = blockIdx.y; // 0, 1, 2
+    const int row = blockIdx.x;
+    const int c   = blockIdx.y; // 0, 1, 2
     if (row >= tokens || c >= 3) { return; }
-    const int tid  = threadIdx.x; // 0..575
+    const int tid  = threadIdx.x; // 0..287 (9 warps, 8 BF16/thread)
     const int warp = tid >> 5;
     const int lane = tid & 31;
-    const int idx  = tid * 4;
+    const int idx  = tid * 8;
 
-    const float4 vc = load_bf16x4(args.cur[c] + static_cast<std::int64_t>(row) * 2304 + idx);
-    const float4 vm = load_bf16x4(args.msg[c] + static_cast<std::int64_t>(row) * 2304 + idx);
-    const float sqc = warp_sum(vc.x * vc.x + vc.y * vc.y + vc.z * vc.z + vc.w * vc.w);
-    const float sqm = warp_sum(vm.x * vm.x + vm.y * vm.y + vm.z * vm.z + vm.w * vm.w);
+    const __nv_bfloat16* cur_p = (c == 0) ? cur0 : ((c == 1) ? cur1 : cur2);
+    const __nv_bfloat16* msg_p = (c == 0) ? msg0 : ((c == 1) ? msg1 : msg2);
+    float vc[8], vm[8];
+    load_bf16x8(cur_p + static_cast<std::int64_t>(row) * 2304 + idx, vc);
+    load_bf16x8(msg_p + static_cast<std::int64_t>(row) * 2304 + idx, vm);
+    float sqc = 0.0f, sqm = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        sqc = fmaf(vc[j], vc[j], sqc);
+        sqm = fmaf(vm[j], vm[j], sqm);
+    }
+    sqc = warp_sum(sqc);
+    sqm = warp_sum(sqm);
     if (lane == 0) {
         s_red[0][warp] = sqc;
         s_red[1][warp] = sqm;
     }
     __syncthreads();
     if (warp < 2) {
-        const float sum = warp_sum((lane < 18) ? s_red[warp][lane] : 0.0f);
+        const float sum = warp_sum((lane < 9) ? s_red[warp][lane] : 0.0f);
         if (lane == 0) { s_inv[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
     }
     __syncthreads();
 
     const float ic = s_inv[0];
     const float im = s_inv[1];
-    __nv_bfloat16* zrow =
-        z_all + (static_cast<std::int64_t>(c) * tokens + row) * 4608;
-    store_bf16x4(zrow + idx, vc.x * ic, vc.y * ic, vc.z * ic, vc.w * ic);
-    store_bf16x4(zrow + 2304 + idx, vm.x * im, vm.y * im, vm.z * im, vm.w * im);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        vc[j] *= ic;
+        vm[j] *= im;
+    }
+    __nv_bfloat16* zrow = z_all + (static_cast<std::int64_t>(c) * tokens + row) * 4608;
+    store_bf16x8(zrow + idx, vc);
+    store_bf16x8(zrow + 2304 + idx, vm);
 }
 
-// 192 CTAs (grid = (64, 3)): [4608 -> 64] down-projection for all 3 controllers simultaneously!
-template <int ActiveT, int WarpsPerRow>
-__global__ __launch_bounds__(WarpsPerRow * 32, 2) void loop_control_down_qkv_small_t_kernel(
-    LoopCtrlQkvArgs args, const __nv_bfloat16* __restrict__ z_all,
+// 192 CTAs (grid = (64, 3)), 256 threads (8 warps/row) + 2-deep weight prefetch, ZERO stack frame!
+template <int ActiveT>
+__global__ __launch_bounds__(256, 4) void loop_control_down_qkv_pf2_kernel(
+    const __nv_bfloat16* __restrict__ down0, const __nv_bfloat16* __restrict__ down1,
+    const __nv_bfloat16* __restrict__ down2, const __nv_bfloat16* __restrict__ z_all,
     __nv_bfloat16* __restrict__ h_all) {
-    __shared__ float smem[ActiveT][WarpsPerRow];
+    __shared__ float smem[ActiveT][8];
     const int row  = blockIdx.x; // 0..63
     const int c    = blockIdx.y; // 0..2
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
+    const int tid  = threadIdx.x; // 0..255
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
 
+    const __nv_bfloat16* down = (c == 0) ? down0 : ((c == 1) ? down1 : down2);
     const __nv_bfloat16* z    = z_all + static_cast<std::int64_t>(c) * ActiveT * 4608;
-    const __nv_bfloat16* wrow = args.down[c] + static_cast<std::int64_t>(row) * 4608;
+    const uint4* wp           = reinterpret_cast<const uint4*>(down + static_cast<std::int64_t>(row) * 4608);
     __nv_bfloat16* h_out      = h_all + static_cast<std::int64_t>(c) * ActiveT * 64;
 
     constexpr int kK8  = 4608 / 8; // 576
     float acc[ActiveT] = {};
 
-    for (int i = threadIdx.x; i < kK8; i += WarpsPerRow * 32) {
-        const uint4 wv = ld_global_cg_u4(reinterpret_cast<const uint4*>(wrow) + i);
-        const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-        float wf[8];
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 f = __bfloat1622float2(wb[j]);
-            wf[2 * j]      = f.x;
-            wf[2 * j + 1]  = f.y;
-        }
+    uint4 w_cur = ld_global_cg_u4(wp + tid);
+    for (int i = tid; i < kK8; i += 256) {
+        uint4 w_nxt{};
+        if (i + 256 < kK8) { w_nxt = ld_global_cg_u4(wp + i + 256); }
+        const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+        const float2 w0 = __bfloat1622float2(wb[0]);
+        const float2 w1 = __bfloat1622float2(wb[1]);
+        const float2 w2 = __bfloat1622float2(wb[2]);
+        const float2 w3 = __bfloat1622float2(wb[3]);
 #pragma unroll
         for (int ti = 0; ti < ActiveT; ++ti) {
             const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
                 z + static_cast<std::int64_t>(ti) * 4608) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 xf = __bfloat1622float2(xb[j]);
-                a0              = fmaf(wf[2 * j], xf.x, a0);
-                a1              = fmaf(wf[2 * j + 1], xf.y, a1);
-            }
-            acc[ti] += a0 + a1;
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+            const float2 x0 = __bfloat1622float2(xb[0]);
+            const float2 x1 = __bfloat1622float2(xb[1]);
+            const float2 x2 = __bfloat1622float2(xb[2]);
+            const float2 x3 = __bfloat1622float2(xb[3]);
+            acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+            acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+            acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+            acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
         }
+        w_cur = w_nxt;
     }
 
 #pragma unroll
@@ -720,17 +1139,22 @@ __global__ __launch_bounds__(WarpsPerRow * 32, 2) void loop_control_down_qkv_sma
     __syncthreads();
 
     if (warp == 0 && lane < ActiveT) {
-        const int ti = lane;
-        float sum    = 0.0f;
-#pragma unroll
-        for (int s = 0; s < WarpsPerRow; ++s) { sum += smem[ti][s]; }
-        h_out[static_cast<std::int64_t>(ti) * 64 + row] = __float2bfloat16_rn(sum);
+        const float sum = ((smem[lane][0] + smem[lane][1]) + (smem[lane][2] + smem[lane][3])) +
+                          ((smem[lane][4] + smem[lane][5]) + (smem[lane][6] + smem[lane][7]));
+        h_out[static_cast<std::int64_t>(lane) * 64 + row] = __float2bfloat16_rn(sum);
     }
 }
 
 template <int MaxTB>
 __global__ __launch_bounds__(128, 4) void loop_control_up_blend_qkv_k64_kernel(
-    LoopCtrlQkvArgs args, const __nv_bfloat16* __restrict__ h_all,
+    const __nv_bfloat16* __restrict__ cur0, const __nv_bfloat16* __restrict__ cur1,
+    const __nv_bfloat16* __restrict__ cur2, const __nv_bfloat16* __restrict__ msg0,
+    const __nv_bfloat16* __restrict__ msg1, const __nv_bfloat16* __restrict__ msg2,
+    const __nv_bfloat16* __restrict__ gf0, const __nv_bfloat16* __restrict__ gf1,
+    const __nv_bfloat16* __restrict__ gf2, const __nv_bfloat16* __restrict__ norm0,
+    const __nv_bfloat16* __restrict__ norm1, const __nv_bfloat16* __restrict__ norm2,
+    __nv_bfloat16* __restrict__ out0, __nv_bfloat16* __restrict__ out1,
+    __nv_bfloat16* __restrict__ out2, const __nv_bfloat16* __restrict__ h_all,
     float* __restrict__ partial_sq_all, int tokens) {
     __shared__ float s_h[MaxTB][64];
     __shared__ float s_sq[MaxTB][4];
@@ -745,13 +1169,14 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_qkv_k64_kernel(
     const int t_base = blockIdx.y * MaxTB;
     const int t_cnt  = min(MaxTB, tokens - t_base);
 
-    const __nv_bfloat16* h    = h_all + static_cast<std::int64_t>(c) * tokens * 64;
-    const __nv_bfloat16* gf_w = args.gf[c];
-    const __nv_bfloat16* cur  = args.cur[c];
-    const __nv_bfloat16* msg  = args.msg[c];
-    __nv_bfloat16* out        = args.out[c];
-    const bool want_sq        = (args.norm[c] != nullptr);
-    float* partial_sq         = want_sq ? (partial_sq_all + static_cast<std::int64_t>(c) * tokens * 72) : nullptr;
+    const __nv_bfloat16* h      = h_all + static_cast<std::int64_t>(c) * tokens * 64;
+    const __nv_bfloat16* gf_w   = (c == 0) ? gf0 : ((c == 1) ? gf1 : gf2);
+    const __nv_bfloat16* cur    = (c == 0) ? cur0 : ((c == 1) ? cur1 : cur2);
+    const __nv_bfloat16* msg    = (c == 0) ? msg0 : ((c == 1) ? msg1 : msg2);
+    const __nv_bfloat16* norm_w = (c == 0) ? norm0 : ((c == 1) ? norm1 : norm2);
+    __nv_bfloat16* out          = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
+    const bool want_sq          = (norm_w != nullptr);
+    float* partial_sq           = want_sq ? (partial_sq_all + static_cast<std::int64_t>(c) * tokens * 72) : nullptr;
 
     for (int e = tid; e < t_cnt * 64; e += 128) {
         const int lt = e >> 6;
@@ -824,24 +1249,28 @@ __global__ __launch_bounds__(128, 4) void loop_control_up_blend_qkv_k64_kernel(
     if (want_sq) {
         __syncthreads();
         if (tid < t_cnt) {
-            const float tot = s_sq[tid][0] + s_sq[tid][1] + s_sq[tid][2] + s_sq[tid][3];
+            const float tot = (s_sq[tid][0] + s_sq[tid][1]) + (s_sq[tid][2] + s_sq[tid][3]);
             partial_sq[static_cast<std::int64_t>(t_base + tid) * 72 + blockIdx.x] = tot;
         }
     }
 }
 
-__global__ void loop_control_post_norm_qkv_h2304_kernel(LoopCtrlQkvArgs args,
-                                                        const float* __restrict__ partial_sq_all,
-                                                        int tokens, float eps) {
+__global__ void loop_control_post_norm_qkv_h2304_kernel(
+    const __nv_bfloat16* __restrict__ norm0, const __nv_bfloat16* __restrict__ norm1,
+    const __nv_bfloat16* __restrict__ norm2, __nv_bfloat16* __restrict__ out0,
+    __nv_bfloat16* __restrict__ out1, __nv_bfloat16* __restrict__ out2,
+    const float* __restrict__ partial_sq_all, int tokens, float eps) {
     __shared__ float s_w[3];
     __shared__ float s_inv;
 
-    const int row  = blockIdx.x;
-    const int c    = blockIdx.y; // 0..2
-    if (row >= tokens || c >= 3 || args.norm[c] == nullptr) { return; }
-    const int tid  = threadIdx.x; // 0..575
-    const int warp = tid >> 5;
-    const int lane = tid & 31;
+    const int row               = blockIdx.x;
+    const int c                 = blockIdx.y; // 0..2
+    const __nv_bfloat16* norm_p = (c == 0) ? norm0 : ((c == 1) ? norm1 : norm2);
+    if (row >= tokens || c >= 3 || norm_p == nullptr) { return; }
+    __nv_bfloat16* out_p = (c == 0) ? out0 : ((c == 1) ? out1 : out2);
+    const int tid        = threadIdx.x; // 0..287 (9 warps, 8 BF16/thread)
+    const int warp       = tid >> 5;
+    const int lane       = tid & 31;
 
     const float* partial_sq = partial_sq_all + static_cast<std::int64_t>(c) * tokens * 72;
     if (warp < 3) {
@@ -858,11 +1287,46 @@ __global__ void loop_control_post_norm_qkv_h2304_kernel(LoopCtrlQkvArgs args,
     __syncthreads();
 
     const float inv     = s_inv;
-    const int idx       = tid * 4;
-    __nv_bfloat16* orow = args.out[c] + static_cast<std::int64_t>(row) * 2304 + idx;
-    const float4 v      = load_bf16x4(orow);
-    const float4 nw     = load_bf16x4(args.norm[c] + idx);
-    store_bf16x4(orow, v.x * inv * nw.x, v.y * inv * nw.y, v.z * inv * nw.z, v.w * inv * nw.w);
+    const int idx       = tid * 8;
+    __nv_bfloat16* orow = out_p + static_cast<std::int64_t>(row) * 2304 + idx;
+    float v[8], nw[8];
+    load_bf16x8(orow, v);
+    load_bf16x8(norm_p + idx, nw);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { v[j] = v[j] * inv * nw[j]; }
+    store_bf16x8(orow, v);
+}
+
+// ============================================================================
+// 4c. Fused Pass-Transition Bank Swap (1 vectorized launch replacing 3 D2D copies)
+// ============================================================================
+
+__global__ void swap_pass_banks_vec8_kernel(
+    const uint4* __restrict__ src_bank0, const uint4* __restrict__ prelude,
+    uint4* __restrict__ cur, uint4* __restrict__ bank0, uint4* __restrict__ bank_out,
+    std::size_t n8) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n8) { return; }
+    const uint4 b0 = __ldg(src_bank0 + i);
+    const uint4 cv = __ldg(cur + i);
+    const uint4 pv = __ldg(prelude + i);
+    bank0[i]       = b0;
+    bank_out[i]    = cv;
+    cur[i]         = pv;
+}
+
+__global__ void swap_pass_banks_scalar_kernel(
+    const __nv_bfloat16* __restrict__ src_bank0, const __nv_bfloat16* __restrict__ prelude,
+    __nv_bfloat16* __restrict__ cur, __nv_bfloat16* __restrict__ bank0,
+    __nv_bfloat16* __restrict__ bank_out, std::size_t elems) {
+    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= elems) { return; }
+    const __nv_bfloat16 b0 = __ldg(src_bank0 + i);
+    const __nv_bfloat16 cv = __ldg(cur + i);
+    const __nv_bfloat16 pv = __ldg(prelude + i);
+    bank0[i]               = b0;
+    bank_out[i]            = cv;
+    cur[i]                 = pv;
 }
 
 // Generic fallbacks for non-2304 hidden sizes
@@ -1081,26 +1545,113 @@ void inkling2_attn_res_mix_pair(const void* const* src0, std::int32_t num_src0,
     inkling2_attn_res_mix(src1, num_src1, q1_f32, norm1, out1, num_q1, hidden, tokens, eps, stream);
 }
 
+void inkling2_attn_res_mix_and_prep(const void* const* source_ptrs, std::int32_t num_sources,
+                                    const Tensor& query_f32, const Tensor& msg,
+                                    Tensor& out_mixed, Tensor& out_z, float eps,
+                                    cudaStream_t stream) {
+    const int tokens = out_mixed.ne[1];
+    if (out_mixed.ne[0] != 2304 || num_sources < 1 || num_sources > 5) {
+        void* outs[1] = {out_mixed.data};
+        inkling2_attn_res_mix(source_ptrs, num_sources, query_f32, nullptr, outs, 1,
+                              out_mixed.ne[0], tokens, eps, stream);
+        loop_control_prep_kernel<<<tokens, 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(out_mixed.data),
+            static_cast<const __nv_bfloat16*>(msg.data),
+            static_cast<__nv_bfloat16*>(out_z.data), out_mixed.ne[0], tokens, eps);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    AttnResArgs args{};
+    for (int s = 0; s < num_sources; ++s) {
+        args.sources[s] = static_cast<const __nv_bfloat16*>(source_ptrs[s]);
+    }
+    const auto* qp = static_cast<const float*>(query_f32.data);
+    const auto* mp = static_cast<const __nv_bfloat16*>(msg.data);
+    auto* om       = static_cast<__nv_bfloat16*>(out_mixed.data);
+    auto* oz       = static_cast<__nv_bfloat16*>(out_z.data);
+    switch (num_sources) {
+    case 1: attn_res_mix_and_prep_h2304_kernel<1><<<tokens, 288, 0, stream>>>(args, qp, mp, om, oz, tokens, eps); break;
+    case 2: attn_res_mix_and_prep_h2304_kernel<2><<<tokens, 288, 0, stream>>>(args, qp, mp, om, oz, tokens, eps); break;
+    case 3: attn_res_mix_and_prep_h2304_kernel<3><<<tokens, 288, 0, stream>>>(args, qp, mp, om, oz, tokens, eps); break;
+    case 4: attn_res_mix_and_prep_h2304_kernel<4><<<tokens, 288, 0, stream>>>(args, qp, mp, om, oz, tokens, eps); break;
+    case 5: attn_res_mix_and_prep_h2304_kernel<5><<<tokens, 288, 0, stream>>>(args, qp, mp, om, oz, tokens, eps); break;
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void inkling2_attn_res_mix_pair_and_prep_qkv(
+    const void* const* bank_srcs, const Tensor& cp_q_f32, void* const* msg_outs,
+    const void* const* cur_srcs, std::int32_t num_cur_srcs, const Tensor& cur_q_f32,
+    void* const* cur_outs, std::int32_t num_cur_q, Tensor& out_z_3t, float eps,
+    cudaStream_t stream) {
+    const int tokens = out_z_3t.ne[1] / 3;
+    AttnResArgs a0{}, a1{};
+    for (int s = 0; s < 2; ++s) { a0.sources[s] = static_cast<const __nv_bfloat16*>(bank_srcs[s]); }
+    for (int q = 0; q < 4; ++q) { a0.outs[q] = static_cast<__nv_bfloat16*>(msg_outs[q]); }
+    for (int s = 0; s < num_cur_srcs; ++s) { a1.sources[s] = static_cast<const __nv_bfloat16*>(cur_srcs[s]); }
+    for (int q = 0; q < num_cur_q; ++q) { a1.outs[q] = static_cast<__nv_bfloat16*>(cur_outs[q]); }
+    const auto* qp0 = static_cast<const float*>(cp_q_f32.data);
+    const auto* qp1 = static_cast<const float*>(cur_q_f32.data);
+    auto* oz        = static_cast<__nv_bfloat16*>(out_z_3t.data);
+    const dim3 grid(tokens, 2);
+    auto launch = [&]<int S1>() {
+        if (num_cur_q == 1) {
+            attn_res_mix_pair_and_prep_qkv_h2304_kernel<S1, 1><<<grid, 288, 0, stream>>>(a0, qp0, a1, qp1, oz, tokens, eps);
+        } else {
+            attn_res_mix_pair_and_prep_qkv_h2304_kernel<S1, 3><<<grid, 288, 0, stream>>>(a0, qp0, a1, qp1, oz, tokens, eps);
+        }
+    };
+    switch (num_cur_srcs) {
+    case 1: launch.template operator()<1>(); break;
+    case 2: launch.template operator()<2>(); break;
+    case 3: launch.template operator()<3>(); break;
+    case 4: launch.template operator()<4>(); break;
+    default: throw std::invalid_argument("inkling2_attn_res_mix_pair_and_prep_qkv: bad num_cur_srcs");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& down_w,
                            const Tensor& gain_forget_w, const Tensor* post_norm_w,
                            Tensor& scratch_z, Tensor& scratch_h, Tensor& scratch_gf,
-                           Tensor& out, float eps, cudaStream_t stream) {
+                           Tensor& out, float eps, cudaStream_t stream,
+                           bool skip_prep, std::int32_t* done_counter) {
+    (void)done_counter;
     const int hidden = cur.ne[0];
     const int tokens = cur.ne[1];
     const int rank   = down_w.ne[1];
 
     if (hidden == 2304 && rank == 64 && tokens <= 32) {
-        // Fast fused path for Inkling-2-Mini decode/verify!
-        loop_control_prep_h2304_kernel<<<tokens, 576, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(cur.data),
-            static_cast<const __nv_bfloat16*>(msg.data),
-            static_cast<__nv_bfloat16*>(scratch_z.data), tokens, eps);
-        CUDA_CHECK(cudaGetLastError());
+        if (!skip_prep) {
+            loop_control_prep_h2304_kernel<<<tokens, 288, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(cur.data),
+                static_cast<const __nv_bfloat16*>(msg.data),
+                static_cast<__nv_bfloat16*>(scratch_z.data), tokens, eps);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
-        inkling2_bf16_linear(scratch_z, down_w, scratch_h, stream);
+        if (tokens <= 8) {
+            const auto* zp = static_cast<const __nv_bfloat16*>(scratch_z.data);
+            const auto* dp = static_cast<const __nv_bfloat16*>(down_w.data);
+            auto* hp       = static_cast<__nv_bfloat16*>(scratch_h.data);
+            switch (tokens) {
+            case 1: loop_control_down_single_pf2_kernel<1><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 2: loop_control_down_single_pf2_kernel<2><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 3: loop_control_down_single_pf2_kernel<3><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 4: loop_control_down_single_pf2_kernel<4><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 5: loop_control_down_single_pf2_kernel<5><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 6: loop_control_down_single_pf2_kernel<6><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 7: loop_control_down_single_pf2_kernel<7><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            case 8: loop_control_down_single_pf2_kernel<8><<<64, 256, 0, stream>>>(zp, dp, hp); break;
+            }
+            CUDA_CHECK(cudaGetLastError());
+        } else {
+            inkling2_bf16_linear(scratch_z, down_w, scratch_h, stream);
+        }
 
-        // Reuse scratch_gf (which is >= 4608 * T * 2 B >> 72 * T * 4 B!) for 72 partial sq floats/token
-        float* partial_sq = post_norm_w ? static_cast<float*>(scratch_gf.data) : nullptr;
+        float* partial_sq  = post_norm_w ? static_cast<float*>(scratch_gf.data) : nullptr;
+        const auto* nw_ptr = post_norm_w ? static_cast<const __nv_bfloat16*>(post_norm_w->data) : nullptr;
+
         if (tokens == 1) {
             loop_control_up_blend_k64_kernel<1><<<dim3(72, 1), 128, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(scratch_h.data),
@@ -1110,6 +1661,13 @@ void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& d
                 static_cast<__nv_bfloat16*>(out.data), partial_sq, tokens);
         } else if (tokens <= 4) {
             loop_control_up_blend_k64_kernel<4><<<dim3(72, 1), 128, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(scratch_h.data),
+                static_cast<const __nv_bfloat16*>(gain_forget_w.data),
+                static_cast<const __nv_bfloat16*>(cur.data),
+                static_cast<const __nv_bfloat16*>(msg.data),
+                static_cast<__nv_bfloat16*>(out.data), partial_sq, tokens);
+        } else if (tokens <= 8) {
+            loop_control_up_blend_k64_kernel<8><<<dim3(72, 1), 128, 0, stream>>>(
                 static_cast<const __nv_bfloat16*>(scratch_h.data),
                 static_cast<const __nv_bfloat16*>(gain_forget_w.data),
                 static_cast<const __nv_bfloat16*>(cur.data),
@@ -1127,27 +1685,28 @@ void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& d
         CUDA_CHECK(cudaGetLastError());
 
         if (post_norm_w != nullptr) {
-            loop_control_post_norm_h2304_kernel<<<tokens, 576, 0, stream>>>(
-                static_cast<__nv_bfloat16*>(out.data),
-                static_cast<const __nv_bfloat16*>(post_norm_w->data), partial_sq, tokens, eps);
+            loop_control_post_norm_h2304_kernel<<<tokens, 288, 0, stream>>>(
+                static_cast<__nv_bfloat16*>(out.data), nw_ptr, partial_sq, tokens, eps);
             CUDA_CHECK(cudaGetLastError());
         }
         return;
     }
 
     // Generic / prefill path (T > 32 uses fast tiled Tensor Core GEMM for down & gain_forget)
-    if (hidden == 2304) {
-        loop_control_prep_h2304_kernel<<<tokens, 576, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(cur.data),
-            static_cast<const __nv_bfloat16*>(msg.data),
-            static_cast<__nv_bfloat16*>(scratch_z.data), tokens, eps);
-    } else {
-        loop_control_prep_kernel<<<tokens, 256, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(cur.data),
-            static_cast<const __nv_bfloat16*>(msg.data),
-            static_cast<__nv_bfloat16*>(scratch_z.data), hidden, tokens, eps);
+    if (!skip_prep) {
+        if (hidden == 2304) {
+            loop_control_prep_h2304_kernel<<<tokens, 288, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(cur.data),
+                static_cast<const __nv_bfloat16*>(msg.data),
+                static_cast<__nv_bfloat16*>(scratch_z.data), tokens, eps);
+        } else {
+            loop_control_prep_kernel<<<tokens, 256, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(cur.data),
+                static_cast<const __nv_bfloat16*>(msg.data),
+                static_cast<__nv_bfloat16*>(scratch_z.data), hidden, tokens, eps);
+        }
+        CUDA_CHECK(cudaGetLastError());
     }
-    CUDA_CHECK(cudaGetLastError());
 
     inkling2_bf16_linear(scratch_z, down_w, scratch_h, stream);
     inkling2_bf16_linear(scratch_h, gain_forget_w, scratch_gf, stream);
@@ -1168,53 +1727,54 @@ void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Ten
                                const Tensor* norm0, const Tensor* norm1, const Tensor* norm2,
                                Tensor& scratch_z, Tensor& scratch_h, Tensor& scratch_gf,
                                Tensor& out0, Tensor& out1, Tensor& out2,
-                               float eps, cudaStream_t stream) {
+                               float eps, cudaStream_t stream,
+                               bool skip_prep, std::int32_t* done_counters) {
+    (void)done_counters;
     const int hidden = cur0.ne[0];
     const int tokens = cur0.ne[1];
     const int rank   = down0.ne[1];
 
     if (hidden == 2304 && rank == 64 && tokens >= 1 && tokens <= 32) {
-        LoopCtrlQkvArgs args{};
-        args.cur[0]  = static_cast<const __nv_bfloat16*>(cur0.data);
-        args.cur[1]  = static_cast<const __nv_bfloat16*>(cur1.data);
-        args.cur[2]  = static_cast<const __nv_bfloat16*>(cur2.data);
-        args.msg[0]  = static_cast<const __nv_bfloat16*>(msg0.data);
-        args.msg[1]  = static_cast<const __nv_bfloat16*>(msg1.data);
-        args.msg[2]  = static_cast<const __nv_bfloat16*>(msg2.data);
-        args.down[0] = static_cast<const __nv_bfloat16*>(down0.data);
-        args.down[1] = static_cast<const __nv_bfloat16*>(down1.data);
-        args.down[2] = static_cast<const __nv_bfloat16*>(down2.data);
-        args.gf[0]   = static_cast<const __nv_bfloat16*>(gf0.data);
-        args.gf[1]   = static_cast<const __nv_bfloat16*>(gf1.data);
-        args.gf[2]   = static_cast<const __nv_bfloat16*>(gf2.data);
-        args.norm[0] = norm0 ? static_cast<const __nv_bfloat16*>(norm0->data) : nullptr;
-        args.norm[1] = norm1 ? static_cast<const __nv_bfloat16*>(norm1->data) : nullptr;
-        args.norm[2] = norm2 ? static_cast<const __nv_bfloat16*>(norm2->data) : nullptr;
-        args.out[0]  = static_cast<__nv_bfloat16*>(out0.data);
-        args.out[1]  = static_cast<__nv_bfloat16*>(out1.data);
-        args.out[2]  = static_cast<__nv_bfloat16*>(out2.data);
+        const auto* c0 = static_cast<const __nv_bfloat16*>(cur0.data);
+        const auto* c1 = static_cast<const __nv_bfloat16*>(cur1.data);
+        const auto* c2 = static_cast<const __nv_bfloat16*>(cur2.data);
+        const auto* m0 = static_cast<const __nv_bfloat16*>(msg0.data);
+        const auto* m1 = static_cast<const __nv_bfloat16*>(msg1.data);
+        const auto* m2 = static_cast<const __nv_bfloat16*>(msg2.data);
+        const auto* d0 = static_cast<const __nv_bfloat16*>(down0.data);
+        const auto* d1 = static_cast<const __nv_bfloat16*>(down1.data);
+        const auto* d2 = static_cast<const __nv_bfloat16*>(down2.data);
+        const auto* g0 = static_cast<const __nv_bfloat16*>(gf0.data);
+        const auto* g1 = static_cast<const __nv_bfloat16*>(gf1.data);
+        const auto* g2 = static_cast<const __nv_bfloat16*>(gf2.data);
+        const auto* n0 = norm0 ? static_cast<const __nv_bfloat16*>(norm0->data) : nullptr;
+        const auto* n1 = norm1 ? static_cast<const __nv_bfloat16*>(norm1->data) : nullptr;
+        const auto* n2 = norm2 ? static_cast<const __nv_bfloat16*>(norm2->data) : nullptr;
+        auto* o0       = static_cast<__nv_bfloat16*>(out0.data);
+        auto* o1       = static_cast<__nv_bfloat16*>(out1.data);
+        auto* o2       = static_cast<__nv_bfloat16*>(out2.data);
 
         auto* z_all = static_cast<__nv_bfloat16*>(scratch_z.data);
         auto* h_all = static_cast<__nv_bfloat16*>(scratch_h.data);
         auto* psq   = static_cast<float*>(scratch_gf.data);
 
-        // 1. Prep all 3 controllers in one launch (grid = (tokens, 3), 576 threads)
-        loop_control_prep_qkv_h2304_kernel<<<dim3(tokens, 3), 576, 0, stream>>>(
-            args, z_all, tokens, eps);
-        CUDA_CHECK(cudaGetLastError());
+        if (!skip_prep) {
+            loop_control_prep_qkv_h2304_kernel<<<dim3(tokens, 3), 288, 0, stream>>>(
+                c0, c1, c2, m0, m1, m2, z_all, tokens, eps);
+            CUDA_CHECK(cudaGetLastError());
+        }
 
-        // 2. Down-project all 3 controllers in ONE launch!
         if (tokens <= 8) {
             const dim3 dgrid(64, 3);
             switch (tokens) {
-            case 1: loop_control_down_qkv_small_t_kernel<1, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 2: loop_control_down_qkv_small_t_kernel<2, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 3: loop_control_down_qkv_small_t_kernel<3, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 4: loop_control_down_qkv_small_t_kernel<4, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 5: loop_control_down_qkv_small_t_kernel<5, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 6: loop_control_down_qkv_small_t_kernel<6, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 7: loop_control_down_qkv_small_t_kernel<7, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
-            case 8: loop_control_down_qkv_small_t_kernel<8, 8><<<dgrid, 256, 0, stream>>>(args, z_all, h_all); break;
+            case 1: loop_control_down_qkv_pf2_kernel<1><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 2: loop_control_down_qkv_pf2_kernel<2><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 3: loop_control_down_qkv_pf2_kernel<3><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 4: loop_control_down_qkv_pf2_kernel<4><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 5: loop_control_down_qkv_pf2_kernel<5><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 6: loop_control_down_qkv_pf2_kernel<6><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 7: loop_control_down_qkv_pf2_kernel<7><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
+            case 8: loop_control_down_qkv_pf2_kernel<8><<<dgrid, 256, 0, stream>>>(d0, d1, d2, z_all, h_all); break;
             }
             CUDA_CHECK(cudaGetLastError());
         } else {
@@ -1227,35 +1787,63 @@ void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Ten
             inkling2_bf16_linear_triple(z0, down0, h0, z1, down1, h1, z2, down2, h2, stream);
         }
 
-        // 3. Up-project + tanh blend all 3 controllers in ONE 216-CTA launch!
+        const bool any_norm = (n0 != nullptr || n1 != nullptr || n2 != nullptr);
+
         if (tokens == 1) {
             loop_control_up_blend_qkv_k64_kernel<1><<<dim3(72, 1, 3), 128, 0, stream>>>(
-                args, h_all, psq, tokens);
+                c0, c1, c2, m0, m1, m2, g0, g1, g2, n0, n1, n2, o0, o1, o2, h_all, psq, tokens);
         } else if (tokens <= 4) {
             loop_control_up_blend_qkv_k64_kernel<4><<<dim3(72, 1, 3), 128, 0, stream>>>(
-                args, h_all, psq, tokens);
+                c0, c1, c2, m0, m1, m2, g0, g1, g2, n0, n1, n2, o0, o1, o2, h_all, psq, tokens);
+        } else if (tokens <= 8) {
+            loop_control_up_blend_qkv_k64_kernel<8><<<dim3(72, 1, 3), 128, 0, stream>>>(
+                c0, c1, c2, m0, m1, m2, g0, g1, g2, n0, n1, n2, o0, o1, o2, h_all, psq, tokens);
         } else {
             loop_control_up_blend_qkv_k64_kernel<8>
-                <<<dim3(72, (tokens + 7) / 8, 3), 128, 0, stream>>>(args, h_all, psq, tokens);
+                <<<dim3(72, (tokens + 7) / 8, 3), 128, 0, stream>>>(
+                    c0, c1, c2, m0, m1, m2, g0, g1, g2, n0, n1, n2, o0, o1, o2, h_all, psq, tokens);
         }
         CUDA_CHECK(cudaGetLastError());
 
-        // 4. Post-RMSNorm all 3 controllers in ONE launch (576 threads)!
-        if (norm0 != nullptr || norm1 != nullptr || norm2 != nullptr) {
-            loop_control_post_norm_qkv_h2304_kernel<<<dim3(tokens, 3), 576, 0, stream>>>(
-                args, psq, tokens, eps);
+        if (any_norm) {
+            loop_control_post_norm_qkv_h2304_kernel<<<dim3(tokens, 3), 288, 0, stream>>>(
+                n0, n1, n2, o0, o1, o2, psq, tokens, eps);
             CUDA_CHECK(cudaGetLastError());
         }
         return;
     }
 
     // Fallback for prefill (T > 32) or non-standard shapes
-    Tensor sz(scratch_z.data, DType::BF16, {2 * hidden, tokens});
+    auto* z_all = static_cast<__nv_bfloat16*>(scratch_z.data);
+    Tensor sz0(z_all, DType::BF16, {2 * hidden, tokens});
+    Tensor sz1(z_all + static_cast<std::int64_t>(tokens) * 2 * hidden, DType::BF16, {2 * hidden, tokens});
+    Tensor sz2(z_all + static_cast<std::int64_t>(2 * tokens) * 2 * hidden, DType::BF16, {2 * hidden, tokens});
     Tensor sh(scratch_h.data, DType::BF16, {rank, tokens});
     Tensor sg(scratch_gf.data, DType::BF16, {2 * hidden, tokens});
-    inkling2_loop_control(cur0, msg0, down0, gf0, norm0, sz, sh, sg, out0, eps, stream);
-    inkling2_loop_control(cur1, msg1, down1, gf1, norm1, sz, sh, sg, out1, eps, stream);
-    inkling2_loop_control(cur2, msg2, down2, gf2, norm2, sz, sh, sg, out2, eps, stream);
+    inkling2_loop_control(cur0, msg0, down0, gf0, norm0, sz0, sh, sg, out0, eps, stream, skip_prep);
+    inkling2_loop_control(cur1, msg1, down1, gf1, norm1, sz1, sh, sg, out1, eps, stream, skip_prep);
+    inkling2_loop_control(cur2, msg2, down2, gf2, norm2, sz2, sh, sg, out2, eps, stream, skip_prep);
+}
+
+void inkling2_swap_pass_banks(const Tensor& src_bank0, const Tensor& prelude,
+                              Tensor& cur, Tensor& bank0, Tensor& bank_out,
+                              cudaStream_t stream) {
+    const std::size_t elems = static_cast<std::size_t>(cur.ne[0]) * cur.ne[1];
+    if (elems == 0) { return; }
+    if ((elems % 8) == 0) {
+        const std::size_t n8 = elems / 8;
+        swap_pass_banks_vec8_kernel<<<static_cast<unsigned>((n8 + 255) / 256), 256, 0, stream>>>(
+            static_cast<const uint4*>(src_bank0.data), static_cast<const uint4*>(prelude.data),
+            static_cast<uint4*>(cur.data), static_cast<uint4*>(bank0.data),
+            static_cast<uint4*>(bank_out.data), n8);
+    } else {
+        swap_pass_banks_scalar_kernel<<<static_cast<unsigned>((elems + 255) / 256), 256, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(src_bank0.data),
+            static_cast<const __nv_bfloat16*>(prelude.data),
+            static_cast<__nv_bfloat16*>(cur.data), static_cast<__nv_bfloat16*>(bank0.data),
+            static_cast<__nv_bfloat16*>(bank_out.data), elems);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops

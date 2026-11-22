@@ -12,11 +12,11 @@
 
 | ワークロード / モード | NInfer（ロスレス NVFP4+MXFP8） | `llama.cpp` `UD-Q4_K_XL` | `llama.cpp` `UD-Q8_K_XL` |
 |---|---:|---:|---:|
-| エッセイ 256 tok、C=1 Normal / DSpark-2（e2e） | **104.8** / **106.9 tok/s** | 30.7 tok/s | 29.3 tok/s |
-| エッセイ 256 tok、C=4 Normal / DSpark-2（合計） | **238.0** / 175.4 tok/s | 78.3 tok/s | 55.9 tok/s |
-| エッセイ 256 tok、C=8 Normal（合計） | **313.2 tok/s** | — | — |
-| Python コードリファクタ 256 tok、C=1 Normal / DSpark-3 | 106.1 / **165.4 tok/s** | — | — |
-| 4,184 tok ニードル検索、C=1 Normal / DSpark-3 | 83.0 / **139.8 tok/s** | — | — |
+| エッセイ 256 tok、C=1 Normal / DSpark-2（e2e） | **122.1** / **126.0 tok/s** | 30.7 tok/s | 29.3 tok/s |
+| エッセイ 256 tok、C=4 Normal / DSpark-2（合計） | **269.0** / **211.9 tok/s** | 78.3 tok/s | 55.9 tok/s |
+| エッセイ 256 tok、C=8 Normal / DSpark-2（合計） | **348.8** / **238.7 tok/s** | — | — |
+| Python コードリファクタ 256 tok、C=1 Normal / DSpark-2 / DSpark-3（engine） | **128.5** / **168.9** / **166.7 tok/s** | — | — |
+| 4,274 tok ニードル検索、C=1 Normal / DSpark-3 | **114.2** / **181.8 tok/s** | — | — |
 
 ### Cold Prefill スループット・TTFT（512〜65,536 トークン）
 
@@ -35,7 +35,7 @@
 
 - 短〜中長文（512〜8K）では既定の `--prefill-chunk 1024` が **810〜1,034 tok/s** と高速で、16K 以上の長文では `--prefill-chunk 2048` が最大 +2.8%（64K で **417.8 tok/s**）上回ります。
 - DSpark-3 有効時の Prefill オーバーヘッドは全コンテキスト長で **1.3%〜3.6%** に収まります。
-- **76/76** の FP64/TP2 演算子単体テスト、PyTorch リファレンスとの **32/32** 完全トークン一致（Normal Graph/Eager および DSpark-2/3/7）、HF `AutoTokenizer` 一致、4K SWA-1024 / Paged-KV 長文ニードル検索、ネイティブ 262K 最大コンテキスト計画、および `C=1..8` 並列サービングを検証済みです。
+- **164/164** の FP64/TP2 演算子単体テスト（全ホットカーネル 0 B スタック/スピル）、PyTorch リファレンスとの **32/32** 完全トークン一致（Normal Graph/Eager および DSpark-2/3/5/7）、HF `AutoTokenizer` 一致、4K SWA-1024 / Paged-KV 長文ニードル検索、ネイティブ 262K 最大コンテキスト計画、および `C=1..8` 並列サービングを検証済みです。
 - **V100-32GB×2 互換性**: VRAM 計画や P2P / NVLink / 非 P2P（CUDA UVA ステージング）フォールバック経路は 16 GB VRAM や PCIe 固定の前提を持たないため、同一の `sm_70` ビルドで **2× V100-32GB**（NVLink / PCIe P2P / 非 P2P）および単体 **V100-32GB (`--tp 1`)** に対応します（物理 32 GB V100 実機での単独ベンチマーク計測は未記録です）。
 
 ### Inkling-2-Mini クイックスタート

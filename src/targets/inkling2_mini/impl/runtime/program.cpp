@@ -134,10 +134,12 @@ struct WorkspaceRegions {
     TensorRegion rel_bias_f32;
     TensorRegion attn_val;
     TensorRegion split_scratch;
+    TensorRegion attn_split_done;
 
     TensorRegion ctrl_z;
     TensorRegion ctrl_h;
     TensorRegion ctrl_gf;
+    TensorRegion ctrl_done;
 
     // MoE scratch
     TensorRegion moe_router_logits;
@@ -330,11 +332,13 @@ WorkspaceRegions build_workspace_regions(const SequenceLayoutSpec& spec) {
     w.rel_bias_f32  = b.add_tensor(DType::FP32, {kRelExtent, num_q, max_T}, 256, "rel_bias");
     w.attn_val      = b.add_tensor(DType::BF16, {q_dim, max_T}, 256, "attn_val");
     w.split_scratch =
-        b.add_tensor(DType::FP32, {kHeadDim + 2, 16, num_q, max_dec_T}, 256, "split_scratch");
+        b.add_tensor(DType::FP32, {kHeadDim + 4, 16, num_q, max_dec_T}, 256, "split_scratch");
+    w.attn_split_done = b.add_tensor(DType::I32, {num_q * max_dec_T}, 256, "attn_split_done");
 
-    w.ctrl_z  = b.add_tensor(DType::BF16, {2 * kHiddenSize, 3 * max_T}, 256, "ctrl_z");
-    w.ctrl_h  = b.add_tensor(DType::BF16, {kGateRank, 3 * max_T}, 256, "ctrl_h");
-    w.ctrl_gf = b.add_tensor(DType::BF16, {2 * kHiddenSize, 3 * max_T}, 256, "ctrl_gf");
+    w.ctrl_z    = b.add_tensor(DType::BF16, {2 * kHiddenSize, 3 * max_T}, 256, "ctrl_z");
+    w.ctrl_h    = b.add_tensor(DType::BF16, {kGateRank, 3 * max_T}, 256, "ctrl_h");
+    w.ctrl_gf   = b.add_tensor(DType::BF16, {2 * kHiddenSize, 3 * max_T}, 256, "ctrl_gf");
+    w.ctrl_done = b.add_tensor(DType::I32, {3}, 256, "ctrl_done");
 
     w.moe_router_logits  = b.add_tensor(DType::FP32, {kNumExperts, max_T}, 256, "moe_rlog");
     w.moe_topk_ids       = b.add_tensor(DType::I32, {kTopK, max_T}, 256, "moe_tids");
@@ -357,8 +361,8 @@ WorkspaceRegions build_workspace_regions(const SequenceLayoutSpec& spec) {
         const std::int32_t blk_T = B * kMtpMaxBlockSize;
         const std::int32_t drf_T = B * (kMtpMaxBlockSize - 1);
         w.mtp_target_caps = b.add_tensor(DType::BF16, {kHiddenSize, 4, max_T}, 256, "mtp_caps");
-        w.mtp_ctx_h       = b.add_tensor(DType::BF16, {kHiddenSize, max_T}, 256, "mtp_ctx_h");
-        w.mtp_kv_ctx      = b.add_tensor(DType::BF16, {2 * kv_dim, max_T}, 256, "mtp_kv_ctx");
+        w.mtp_ctx_h       = b.add_tensor(DType::BF16, {kHiddenSize, 3 * max_T}, 256, "mtp_ctx_h");
+        w.mtp_kv_ctx      = b.add_tensor(DType::BF16, {2 * kv_dim, 3 * max_T}, 256, "mtp_kv_ctx");
         w.mtp_h           = b.add_tensor(DType::BF16, {kHiddenSize, blk_T}, 256, "mtp_h");
         w.mtp_norm        = b.add_tensor(DType::BF16, {kHiddenSize, blk_T}, 256, "mtp_norm");
         w.mtp_qkv         = b.add_tensor(DType::BF16, {5120 / spec.tp, blk_T}, 256, "mtp_qkv");
@@ -374,7 +378,7 @@ WorkspaceRegions build_workspace_regions(const SequenceLayoutSpec& spec) {
         w.mtp_mlp_out     = b.add_tensor(DType::BF16, {kHiddenSize, blk_T}, 256, "mtp_mlp_out");
         w.mtp_draft_h     = b.add_tensor(DType::BF16, {kHiddenSize, drf_T}, 256, "mtp_draft_h");
         w.mtp_base_logits = b.add_tensor(DType::BF16, {vrows, drf_T}, 256, "mtp_base_logits");
-        w.mtp_rnn_state   = b.add_tensor(DType::BF16, {kMtpMarkovRank, B}, 256, "mtp_rnn_state");
+        w.mtp_rnn_state   = b.add_tensor(DType::BF16, {kMtpMarkovRank, B, 2}, 256, "mtp_rnn_state");
         w.mtp_rnn_z       = b.add_tensor(DType::BF16, {2 * kMtpMarkovRank + 2 * kHiddenSize, B},
                                          256, "mtp_rnn_z");
         w.mtp_rnn_proj    = b.add_tensor(DType::BF16, {3 * kMtpMarkovRank, B}, 256, "mtp_rnn_proj");
@@ -474,6 +478,8 @@ struct RankState {
     std::array<Tensor, 4> msgs{};
     Tensor q_gate_r_sink, k_buf, v_buf, k_dyn, v_dyn, q_clip, rel_bias_f32, attn_val, split_scratch;
     Tensor ctrl_z, ctrl_h, ctrl_gf;
+    std::int32_t* attn_split_done = nullptr;
+    std::int32_t* ctrl_done       = nullptr;
     ops::Inkling2MoeScratch moe_sc{};
     Tensor moe_router_logits, moe_inter_bf16;
     Tensor logits_shard_f32, logits_shard_bf16, logits_full_bf16;
@@ -579,11 +585,17 @@ public:
             rs.v_dyn         = wr.v_dyn.bind(w_span);
             rs.q_clip        = wr.q_clip.bind(w_span);
             rs.rel_bias_f32  = wr.rel_bias_f32.bind(w_span);
-            rs.attn_val      = wr.attn_val.bind(w_span);
-            rs.split_scratch = wr.split_scratch.bind(w_span);
-            rs.ctrl_z        = wr.ctrl_z.bind(w_span);
-            rs.ctrl_h        = wr.ctrl_h.bind(w_span);
-            rs.ctrl_gf       = wr.ctrl_gf.bind(w_span);
+            rs.attn_val        = wr.attn_val.bind(w_span);
+            rs.split_scratch   = wr.split_scratch.bind(w_span);
+            Tensor asd         = wr.attn_split_done.bind(w_span);
+            rs.attn_split_done = static_cast<std::int32_t*>(asd.data);
+            CUDA_CHECK(cudaMemsetAsync(rs.attn_split_done, 0, asd.bytes(), rs.dev->stream));
+            rs.ctrl_z    = wr.ctrl_z.bind(w_span);
+            rs.ctrl_h    = wr.ctrl_h.bind(w_span);
+            rs.ctrl_gf   = wr.ctrl_gf.bind(w_span);
+            Tensor cd    = wr.ctrl_done.bind(w_span);
+            rs.ctrl_done = static_cast<std::int32_t*>(cd.data);
+            CUDA_CHECK(cudaMemsetAsync(rs.ctrl_done, 0, cd.bytes(), rs.dev->stream));
 
             rs.moe_router_logits       = wr.moe_router_logits.bind(w_span);
             rs.moe_inter_bf16          = wr.moe_inter_bf16.bind(w_span);
@@ -834,8 +846,8 @@ public:
     // ---- Batched Decode (Normal + DSpark Speculative) ----
     runtime::BatchedGeneratedRound decode_batch(std::span<const std::uint32_t> lanes,
                                                 std::span<const runtime::RoundBudget> budgets) {
-        const auto t0      = Clock::now();
-        const int B        = static_cast<int>(lanes.size());
+        const auto t0 = Clock::now();
+        const int B   = static_cast<int>(lanes.size());
         if (B <= 0 || B > static_cast<int>(max_concurrency_)) {
             throw std::invalid_argument("inkling2 decode_batch: invalid batch size");
         }
@@ -1098,6 +1110,10 @@ public:
             if (!continuing_lanes.empty()) {
                 run_dspark_draft_batch(continuing_lanes);
                 for (const std::uint32_t l : continuing_lanes) { lanes_[l].has_draft = true; }
+            }
+            if (continuing_lanes.empty()) {
+                ranks_[0].dev->synchronize();
+                if (!use_cuda_graph_ && tp_ == 2) { ranks_[1].dev->synchronize(); }
             }
         } else {
             std::vector<std::uint32_t> mtp_lanes;
@@ -1372,23 +1388,22 @@ private:
                     Tensor ctrl_gf_3t(rs.ctrl_gf.data, DType::BF16, {2 * kHiddenSize, 3 * T});
                     if (is_local) {
                         void* outs[1] = {rs.mlp_in.data}; // temp unnormed mixed
-                        ops::inkling2_attn_res_mix_pair(bank_srcs, 2, cp_q, msg_outs, 4,
-                                                        srcs, n_srcs, lw.attn_res_attn_query,
-                                                        nullptr, outs, 1, kHiddenSize, T,
-                                                        kRmsNormEps, s);
+                        ops::inkling2_attn_res_mix_pair_and_prep_qkv(
+                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query, outs,
+                            1, ctrl_z_3t, kRmsNormEps, s);
                         Tensor mixed = slice_t(rs.mlp_in, kHiddenSize);
                         ops::inkling2_loop_control_qkv(
                             mixed, mixed, mixed, msg0, msg1, msg2,
                             lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
                             lw.ctrl_attn.gain_forget, lw.ctrl_k.gain_forget, lw.ctrl_v.gain_forget,
                             &lw.attn_norm, &lw.attn_norm, &lw.attn_norm,
-                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, q_in_t, k_in_t, v_in_t, kRmsNormEps, s);
+                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, q_in_t, k_in_t, v_in_t, kRmsNormEps, s,
+                            /*skip_prep=*/true, rs.ctrl_done);
                     } else {
                         void* outs[3] = {rs.q_in.data, rs.k_in.data, rs.v_in.data};
-                        ops::inkling2_attn_res_mix_pair(bank_srcs, 2, cp_q, msg_outs, 4,
-                                                        srcs, n_srcs, lw.attn_res_attn_query,
-                                                        nullptr, outs, 3, kHiddenSize, T,
-                                                        kRmsNormEps, s);
+                        ops::inkling2_attn_res_mix_pair_and_prep_qkv(
+                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query, outs,
+                            3, ctrl_z_3t, kRmsNormEps, s);
                         Tensor tmp_q = slice_t(rs.mlp_in, kHiddenSize);
                         Tensor tmp_k = slice_t(rs.attn_out, kHiddenSize);
                         Tensor tmp_v = slice_t(rs.moe_out, kHiddenSize);
@@ -1397,7 +1412,8 @@ private:
                             lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
                             lw.ctrl_attn.gain_forget, lw.ctrl_k.gain_forget, lw.ctrl_v.gain_forget,
                             &lw.q_input_norm, &lw.k_input_norm, &lw.v_input_norm,
-                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, tmp_q, tmp_k, tmp_v, kRmsNormEps, s);
+                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, tmp_q, tmp_k, tmp_v, kRmsNormEps, s,
+                            /*skip_prep=*/true, rs.ctrl_done);
                         q_in_t = tmp_q;
                         k_in_t = tmp_k;
                         v_in_t = tmp_v;
@@ -1406,70 +1422,75 @@ private:
                     v_src_proj = &v_in_t;
                 }
 
-                // Projections: Q/gate/R/sink + K + V fused into ONE launch (zero tail wave!)
+                // Projections: Q/gate/R/sink + K + V (+ k_sconv_proj + v_sconv_proj on global Decode/Verify -> ONE 5-way launch!)
                 const std::int32_t qgrs_n = 6552 / tp_;
                 const std::int32_t kv_n   = rs.model->num_kv_heads * kHeadDim;
                 const std::int32_t q_n    = rs.model->num_q_heads * kHeadDim;
-                Tensor qgrs_t = slice_t(rs.q_gate_r_sink, qgrs_n);
-                Tensor k_t    = slice_t(rs.k_buf, kv_n);
-                Tensor v_t    = slice_t(rs.v_buf, kv_n);
-                ops::inkling2_bf16_linear_triple(q_in_t, lw.q_gate_r_sink, qgrs_t,
-                                                 *k_src_proj, lw.k_proj, k_t,
-                                                 *v_src_proj, lw.v_proj, v_t, s);
+                Tensor qgrs_t             = slice_t(rs.q_gate_r_sink, qgrs_n);
+                Tensor k_t                = slice_t(rs.k_buf, kv_n);
+                Tensor v_t                = slice_t(rs.v_buf, kv_n);
+                Tensor k_dyn_t            = slice_t(rs.k_dyn, 4 * rs.model->num_kv_heads);
+                Tensor v_dyn_t            = slice_t(rs.v_dyn, 4 * rs.model->num_kv_heads);
+                const bool fuse_5way_qkv  = (mode != ForwardMode::Prefill && !is_local);
 
-                // K/V causal short convolutions (W = 4) — fused K+V pair kernels!
+                if (fuse_5way_qkv) {
+                    ops::inkling2_bf16_linear_5way(
+                        q_in_t, lw.q_gate_r_sink, qgrs_t, *k_src_proj, lw.k_proj, k_t,
+                        *v_src_proj, lw.v_proj, v_t, *k_src_proj, lw.k_sconv_proj, k_dyn_t,
+                        *v_src_proj, lw.v_sconv_proj, v_dyn_t, s);
+                } else {
+                    ops::inkling2_bf16_linear_triple(q_in_t, lw.q_gate_r_sink, qgrs_t,
+                                                     *k_src_proj, lw.k_proj, k_t,
+                                                     *v_src_proj, lw.v_proj, v_t, s);
+                }
+
+                // K/V causal short convolutions (W = 4):
+                // Prefill uses separate sconv; Decode & Verify fuse K/V SConv directly into attn_prologue!
                 float* sconv_base  = static_cast<float*>(rs.sconv_state.data);
                 float* verify_base = mtp_enabled_ ? static_cast<float*>(rs.sconv_verify.data) : nullptr;
                 const auto* batch_lanes = static_cast<const std::int32_t*>(rs.round_batch_lanes.data);
                 const auto* tok_lanes   = static_cast<const std::int32_t*>(rs.round_tok_lanes.data);
                 const auto* positions   = static_cast<const std::int32_t*>(rs.round_positions.data);
 
-                if (is_local) {
-                    if (mode == ForwardMode::Prefill) {
-                        float* lane_st = sconv_base + static_cast<std::size_t>(prefill_lane) * lane_sconv_stride;
+                ops::Inkling2AttnSconvArgs fused_sconv{};
+                const ops::Inkling2AttnSconvArgs* fused_sconv_ptr = nullptr;
+
+                if (mode == ForwardMode::Prefill) {
+                    float* lane_st = sconv_base + static_cast<std::size_t>(prefill_lane) * lane_sconv_stride;
+                    if (is_local) {
                         ops::inkling2_sconv_static_prefill(k_t, lw.k_sconv, lane_st + k_off, k_t, nullptr, s);
                         ops::inkling2_sconv_static_prefill(v_t, lw.v_sconv, lane_st + v_off, v_t, nullptr, s);
-                    } else if (mode == ForwardMode::Decode) {
-                        ops::inkling2_sconv_kv_static_decode(k_t, lw.k_sconv, sconv_base + k_off,
-                                                             v_t, lw.v_sconv, sconv_base + v_off,
-                                                             batch_lanes, batch_size, k_t, v_t, s,
-                                                             lane_sconv_stride);
                     } else {
-                        ops::inkling2_sconv_kv_static_verify(
-                            k_t, lw.k_sconv, sconv_base + k_off, verify_base + k_off,
-                            v_t, lw.v_sconv, sconv_base + v_off, verify_base + v_off,
-                            batch_lanes, batch_size, q_per_lane, k_t, v_t, s,
-                            lane_sconv_stride, kMtpMaxBlockSize);
-                    }
-                } else {
-                    Tensor k_dyn_t = slice_t(rs.k_dyn, 4 * rs.model->num_kv_heads);
-                    Tensor v_dyn_t = slice_t(rs.v_dyn, 4 * rs.model->num_kv_heads);
-                    ops::inkling2_bf16_linear_pair(*k_src_proj, lw.k_sconv_proj, k_dyn_t,
-                                                   *v_src_proj, lw.v_sconv_proj, v_dyn_t, s);
-                    if (mode == ForwardMode::Prefill) {
-                        float* lane_st = sconv_base + static_cast<std::size_t>(prefill_lane) * lane_sconv_stride;
+                        ops::inkling2_bf16_linear_pair(*k_src_proj, lw.k_sconv_proj, k_dyn_t,
+                                                       *v_src_proj, lw.v_sconv_proj, v_dyn_t, s);
                         ops::inkling2_sconv_dynamic_prefill(k_t, k_dyn_t, lw.k_sconv,
                                                             rs.model->num_kv_heads, lane_st + k_off,
                                                             k_t, s);
                         ops::inkling2_sconv_dynamic_prefill(v_t, v_dyn_t, lw.v_sconv,
                                                             rs.model->num_kv_heads, lane_st + v_off,
                                                             v_t, s);
-                    } else if (mode == ForwardMode::Decode) {
-                        ops::inkling2_sconv_kv_dynamic_decode(
-                            k_t, k_dyn_t, lw.k_sconv, sconv_base + k_off,
-                            v_t, v_dyn_t, lw.v_sconv, sconv_base + v_off,
-                            rs.model->num_kv_heads, batch_lanes, batch_size, k_t, v_t, s,
-                            lane_sconv_stride);
-                    } else {
-                        ops::inkling2_sconv_kv_dynamic_verify(
-                            k_t, k_dyn_t, lw.k_sconv, sconv_base + k_off, verify_base + k_off,
-                            v_t, v_dyn_t, lw.v_sconv, sconv_base + v_off, verify_base + v_off,
-                            rs.model->num_kv_heads, batch_lanes, batch_size, q_per_lane, k_t, v_t,
-                            s, lane_sconv_stride, kMtpMaxBlockSize);
                     }
+                } else {
+                    fused_sconv.is_dynamic     = !is_local;
+                    fused_sconv.k_weight       = lw.k_sconv.data;
+                    fused_sconv.v_weight       = lw.v_sconv.data;
+                    fused_sconv.k_state_pool   = sconv_base + k_off;
+                    fused_sconv.v_state_pool   = sconv_base + v_off;
+                    fused_sconv.lane_stride    = lane_sconv_stride;
+                    fused_sconv.q_per_lane     = q_per_lane;
+                    fused_sconv.max_verify_len = kMtpMaxBlockSize;
+                    if (mode == ForwardMode::Verify) {
+                        fused_sconv.k_verify_pool = verify_base + k_off;
+                        fused_sconv.v_verify_pool = verify_base + v_off;
+                    }
+                    if (!is_local) {
+                        fused_sconv.k_dyn = k_dyn_t.data;
+                        fused_sconv.v_dyn = v_dyn_t.data;
+                    }
+                    fused_sconv_ptr = &fused_sconv;
                 }
 
-                // Attention prologue: Q/R L2-clip (+tau), K L2-clip + V RMSNorm -> KV cache, R@proj -> rel_bias
+                // Attention prologue: Q/R L2-clip (+tau), fused K/V SConv + K clip + V RMSNorm -> KV, R@proj -> rel_bias
                 const ops::Inkling2KvTarget kv = make_kv_target(rs, il);
                 Tensor q_clip_t(rs.q_clip.data, DType::BF16, {kHeadDim, rs.model->num_q_heads, T});
                 Tensor rb_t(rs.rel_bias_f32.data, DType::FP32,
@@ -1479,9 +1500,9 @@ private:
                                             rs.model->num_q_heads, rs.model->num_kv_heads, kv,
                                             is_local, kQkClipThreshold, kRelClipThreshold,
                                             kLogScalingFloor, kLogScalingAlpha, kRmsNormEps,
-                                            q_clip_t, rb_t, s);
+                                            q_clip_t, rb_t, s, fused_sconv_ptr);
 
-                // Attention kernel + fused sigmoid(gate)
+                // Attention kernel + fused sigmoid(gate) (single-launch adaptive Last-CTA Split-KV!)
                 Tensor aval_t = slice_t(rs.attn_val, q_n);
                 if (mode == ForwardMode::Prefill) {
                     ops::inkling2_attn_prefill(q_clip_t, qgrs_t, rb_t, kv, prefill_lane,
@@ -1491,22 +1512,34 @@ private:
                     ops::inkling2_attn_decode_verify(
                         q_clip_t, qgrs_t, rb_t, kv, batch_lanes, positions, batch_size, q_per_lane,
                         rs.model->num_q_heads, rs.model->num_kv_heads, kSwaWindow,
-                        static_cast<float*>(rs.split_scratch.data), 16, aval_t, s);
+                        static_cast<float*>(rs.split_scratch.data), 16, aval_t, s,
+                        rs.attn_split_done);
                 }
 
                 // O projection (row-parallel)
                 ops::inkling2_bf16_linear(aval_t, lw.o_proj, attn_pair[r], s);
             }
 
-            // TP2 AllReduce + attn_sconv + block copy / residual (FUSED into ONE kernel on TP2 direct-P2P Decode!)
+            // TP2 AllReduce + attn_sconv + block copy / residual (FUSED for BOTH Decode AND Verify!)
             const bool is_block_boundary = (ip % kAttnResBlockSize == 0);
-            const bool can_fuse_tp2_ar_sconv =
+            const bool can_fuse_tp2_ar_sconv_decode =
                 (mode == ForwardMode::Decode && tp_ == 2 && peer_events_.has_value() &&
                  peer_events_->packet_storage(0) != nullptr &&
                  attn_pair[0].bytes() <= peer_events_->packet_capacity_bytes() &&
                  (attn_pair[0].bytes() % 16 == 0));
+            const int verify_packs_per_cta = (q_per_lane >= 2) ? (64 / q_per_lane) : 1;
+            const std::size_t verify_epoch_bytes_need =
+                static_cast<std::size_t>((batch_size * (kHiddenSize / 8) + verify_packs_per_cta - 1) /
+                                         verify_packs_per_cta) *
+                64ULL * 16ULL;
+            const bool can_fuse_tp2_ar_sconv_verify =
+                (mode == ForwardMode::Verify && q_per_lane >= 2 && q_per_lane <= 8 && tp_ == 2 &&
+                 peer_events_.has_value() && peer_events_->packet_storage(0) != nullptr &&
+                 verify_epoch_bytes_need <= peer_events_->packet_capacity_bytes());
+            const bool can_fuse_tp2_ar_sconv =
+                can_fuse_tp2_ar_sconv_decode || can_fuse_tp2_ar_sconv_verify;
 
-            if (can_fuse_tp2_ar_sconv) {
+            if (can_fuse_tp2_ar_sconv_decode) {
                 for (int r = 0; r < 2; ++r) {
                     auto& rs       = ranks_[static_cast<std::size_t>(r)];
                     const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
@@ -1523,11 +1556,32 @@ private:
                         static_cast<const std::int32_t*>(rs.round_batch_lanes.data), batch_size,
                         lane_sconv_stride, ffn_t, res_add, blk_src, blk_dst_ptr, rs.dev->stream);
                 }
+            } else if (can_fuse_tp2_ar_sconv_verify) {
+                for (int r = 0; r < 2; ++r) {
+                    auto& rs       = ranks_[static_cast<std::size_t>(r)];
+                    const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    Tensor ffn_t   = slice_t(rs.ffn_inp, kHiddenSize);
+                    Tensor blk_dst = slice_t(rs.blocks[static_cast<std::size_t>(num_blocks)], kHiddenSize);
+                    const Tensor* res_add = is_block_boundary ? nullptr : &cur_pair[r];
+                    const Tensor* blk_src = is_block_boundary ? &cur_pair[r] : nullptr;
+                    Tensor* blk_dst_ptr   = is_block_boundary ? &blk_dst : nullptr;
+                    ops::inkling2_tp2_packet_allreduce_sconv_verify(
+                        attn_pair[r], peer_events_->packet_storage(r),
+                        peer_events_->packet_storage(1 - r), peer_events_->packet_capacity_bytes(),
+                        lw.attn_sconv, static_cast<const float*>(rs.sconv_state.data) + attn_off,
+                        static_cast<float*>(rs.sconv_verify.data) + attn_off,
+                        static_cast<const std::int32_t*>(rs.round_batch_lanes.data), batch_size,
+                        q_per_lane, lane_sconv_stride, kMtpMaxBlockSize, ffn_t, res_add, blk_src,
+                        blk_dst_ptr, rs.dev->stream);
+                }
             } else {
                 allreduce_bf16(attn_pair, ar_pair);
             }
 
             // --- Part B: (unfused attn_sconv if needed) + Pre-MoE AttnRes/Control + Router + MoE ---
+            const bool fuse_moe_prep = (T >= 2 && T <= 8);
+            const bool fuse_moe_cast = (T >= 2 && can_fuse_tp2_ar_sconv);
             for (int r = 0; r < tp_; ++r) {
                 auto& rs     = ranks_[static_cast<std::size_t>(r)];
                 const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
@@ -1580,22 +1634,23 @@ private:
                     ops::inkling2_attn_res_mix(m_srcs, cur_blocks + 1, lw.attn_res_mlp_query, nw,
                                                outs, 1, kHiddenSize, T, kRmsNormEps, s);
                 } else {
-                    void* outs[1] = {rs.q_in.data}; // temp unnormed mlp_in
-                    ops::inkling2_attn_res_mix(m_srcs, cur_blocks + 1, lw.attn_res_mlp_query,
-                                               nullptr, outs, 1, kHiddenSize, T, kRmsNormEps, s);
-                    Tensor q_tmp    = slice_t(rs.q_in, kHiddenSize);
-                    Tensor msg3     = slice_t(rs.msgs[3], kHiddenSize);
-                    Tensor ctrl_z_t = slice_t(rs.ctrl_z, 2 * kHiddenSize);
-                    Tensor ctrl_h_t = slice_t(rs.ctrl_h, kGateRank);
+                    Tensor q_tmp     = slice_t(rs.q_in, kHiddenSize);
+                    Tensor msg3      = slice_t(rs.msgs[3], kHiddenSize);
+                    Tensor ctrl_z_t  = slice_t(rs.ctrl_z, 2 * kHiddenSize);
+                    Tensor ctrl_h_t  = slice_t(rs.ctrl_h, kGateRank);
                     Tensor ctrl_gf_t = slice_t(rs.ctrl_gf, 2 * kHiddenSize);
+                    ops::inkling2_attn_res_mix_and_prep(m_srcs, cur_blocks + 1, lw.attn_res_mlp_query,
+                                                        msg3, q_tmp, ctrl_z_t, kRmsNormEps, s);
                     ops::inkling2_loop_control(q_tmp, msg3, lw.ctrl_mlp.down,
                                                lw.ctrl_mlp.gain_forget, &lw.mlp_norm, ctrl_z_t,
-                                               ctrl_h_t, ctrl_gf_t, mlp_t, kRmsNormEps, s);
+                                               ctrl_h_t, ctrl_gf_t, mlp_t, kRmsNormEps, s,
+                                               /*skip_prep=*/true, rs.ctrl_done);
                 }
 
-                // Fused Router (GEMV + sigmoid + bias top-8 + grouping in ONE launch via Last-CTA sync!)
+                // Fused Single-Wave Router (+ x_staged prestage + accum_f32 zeroing for T=2..8!)
+                const std::int32_t prep_mode = fuse_moe_prep ? (lw.is_nvfp4 ? 1 : 2) : 0;
                 ops::inkling2_moe_router_fused(mlp_t, lw.router_weight, lw.router_bias,
-                                               kRouteScale, rs.moe_sc, s);
+                                               kRouteScale, rs.moe_sc, s, prep_mode);
 
                 // Sparse MoE (NVFP4 layers 0..19, MXFP8 layers 20..23)
                 if (lw.is_nvfp4) {
@@ -1603,29 +1658,50 @@ private:
                                                     lw.w13_denom, lw.w2_codes, lw.w2_scales,
                                                     lw.w2_amax, lw.w2_denom, rs.model->moe_slabs,
                                                     kMlpGateSoftcap, kMlpUpSoftcap, rs.moe_sc,
-                                                    moe_pair[r], s);
+                                                    moe_pair[r], s, fuse_moe_prep, fuse_moe_cast);
                 } else {
                     ops::inkling2_moe_mxfp8_forward(mlp_t, lw.w13_codes, lw.w13_scales, lw.w2_codes,
                                                     lw.w2_scales, rs.model->moe_slabs,
                                                     kMlpGateSoftcap, kMlpUpSoftcap, rs.moe_sc,
-                                                    moe_pair[r], s);
+                                                    moe_pair[r], s, fuse_moe_prep, fuse_moe_cast);
                 }
             }
             if (is_block_boundary) { ++num_blocks; }
 
-            // TP2 AllReduce + mlp_sconv + fused residual add with ffn_inp -> cur (FUSED on TP2 direct-P2P Decode!)
-            if (can_fuse_tp2_ar_sconv) {
+            // TP2 AllReduce + mlp_sconv + fused residual add with ffn_inp -> cur (FUSED for Decode & Verify!)
+            if (can_fuse_tp2_ar_sconv_decode) {
                 for (int r = 0; r < 2; ++r) {
                     auto& rs       = ranks_[static_cast<std::size_t>(r)];
                     const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
                     CUDA_CHECK(cudaSetDevice(rs.dev->device));
                     Tensor ffn_t = slice_t(rs.ffn_inp, kHiddenSize);
+                    Tensor partial_src =
+                        fuse_moe_cast ? Tensor(rs.moe_sc.accum_f32, DType::FP32, {kHiddenSize, T})
+                                      : moe_pair[r];
                     ops::inkling2_tp2_packet_allreduce_sconv_decode(
-                        moe_pair[r], peer_events_->packet_storage(r),
+                        partial_src, peer_events_->packet_storage(r),
                         peer_events_->packet_storage(1 - r), peer_events_->packet_capacity_bytes(),
                         lw.mlp_sconv, static_cast<float*>(rs.sconv_state.data) + mlp_off,
                         static_cast<const std::int32_t*>(rs.round_batch_lanes.data), batch_size,
                         lane_sconv_stride, cur_pair[r], &ffn_t, nullptr, nullptr, rs.dev->stream);
+                }
+            } else if (can_fuse_tp2_ar_sconv_verify) {
+                for (int r = 0; r < 2; ++r) {
+                    auto& rs       = ranks_[static_cast<std::size_t>(r)];
+                    const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    Tensor ffn_t = slice_t(rs.ffn_inp, kHiddenSize);
+                    Tensor partial_src =
+                        fuse_moe_cast ? Tensor(rs.moe_sc.accum_f32, DType::FP32, {kHiddenSize, T})
+                                      : moe_pair[r];
+                    ops::inkling2_tp2_packet_allreduce_sconv_verify(
+                        partial_src, peer_events_->packet_storage(r),
+                        peer_events_->packet_storage(1 - r), peer_events_->packet_capacity_bytes(),
+                        lw.mlp_sconv, static_cast<const float*>(rs.sconv_state.data) + mlp_off,
+                        static_cast<float*>(rs.sconv_verify.data) + mlp_off,
+                        static_cast<const std::int32_t*>(rs.round_batch_lanes.data), batch_size,
+                        q_per_lane, lane_sconv_stride, kMtpMaxBlockSize, cur_pair[r], &ffn_t,
+                        nullptr, nullptr, rs.dev->stream);
                 }
             } else {
                 allreduce_bf16(moe_pair, ar_pair);
@@ -1678,17 +1754,16 @@ private:
         // 2. Looped Core: 3 passes over ip = 6..17
         for (int pass = 0; pass < kNumPasses; ++pass) {
             if (pass > 0) {
-                // bank = [blocks[2]], bank_out = cur; reset cur = prelude, num_blocks = 1
+                // bank0 = blocks[2], bank_out = cur, cur = prelude in ONE vectorized launch (replaces 3 D2D copies)!
                 for (int r = 0; r < tp_; ++r) {
                     auto& rs = ranks_[static_cast<std::size_t>(r)];
                     CUDA_CHECK(cudaSetDevice(rs.dev->device));
-                    const std::size_t bytes = static_cast<std::size_t>(T) * kHiddenSize * 2;
-                    CUDA_CHECK(cudaMemcpyAsync(rs.bank0.data, rs.blocks[2].data, bytes,
-                                               cudaMemcpyDeviceToDevice, rs.dev->stream));
-                    CUDA_CHECK(cudaMemcpyAsync(rs.bank_out.data, rs.cur.data, bytes,
-                                               cudaMemcpyDeviceToDevice, rs.dev->stream));
-                    CUDA_CHECK(cudaMemcpyAsync(rs.cur.data, rs.prelude.data, bytes,
-                                               cudaMemcpyDeviceToDevice, rs.dev->stream));
+                    Tensor blk2_t     = slice_t(rs.blocks[2], kHiddenSize);
+                    Tensor prelude_t  = slice_t(rs.prelude, kHiddenSize);
+                    Tensor bank0_t    = slice_t(rs.bank0, kHiddenSize);
+                    Tensor bank_out_t = slice_t(rs.bank_out, kHiddenSize);
+                    ops::inkling2_swap_pass_banks(blk2_t, prelude_t, cur_pair[r], bank0_t,
+                                                  bank_out_t, rs.dev->stream);
                 }
                 num_blocks = 1;
             }
@@ -1963,31 +2038,43 @@ private:
                                        h_last_dst.size() * sizeof(std::int32_t),
                                        cudaMemcpyHostToDevice, s));
 
-            Tensor ctx_h(rs.mtp_ctx_h.data, DType::BF16, {kHiddenSize, total_count});
-            Tensor kv_ctx(rs.mtp_kv_ctx.data, DType::BF16,
-                          {2 * rs.model->num_kv_heads * kHeadDim, total_count});
+            const std::size_t ctx_h_bytes =
+                static_cast<std::size_t>(total_count) * kHiddenSize * 2;
+            const std::int32_t kv2_dim    = 2 * rs.model->num_kv_heads * kHeadDim;
+            const std::size_t kv_ctx_bytes =
+                static_cast<std::size_t>(total_count) * static_cast<std::size_t>(kv2_dim) * 2;
+            auto* ctx_h_base  = static_cast<std::byte*>(rs.mtp_ctx_h.data);
+            auto* kv_ctx_base = static_cast<std::byte*>(rs.mtp_kv_ctx.data);
 
-            for (int li = 0; li < kMtpNumLayers; ++li) {
-                const auto& ml = rs.model->mtp.layers[static_cast<std::size_t>(li)];
-                ops::inkling2_mtp_mix_rmsnorm_indexed(
-                    rs.mtp_target_caps,
-                    static_cast<const std::int32_t*>(rs.round_mtp_src_idx.data), nullptr,
-                    total_count, rs.model->mtp.fuse_weight, li, ml.dflare_norm, kRmsNormEps,
-                    ctx_h, s);
-                ops::inkling2_bf16_linear(ctx_h, ml.kv_ctx, kv_ctx, s);
-                ops::inkling2_mtp_ctx_kv_write(
-                    kv_ctx, ml.k_norm_ctx, static_cast<const std::int32_t*>(rs.round_positions.data),
-                    static_cast<const std::int32_t*>(rs.round_tok_lanes.data), total_count,
-                    rs.model->num_kv_heads, kMtpRopeTheta, kRmsNormEps, make_mtp_kv_target(rs, li),
-                    s);
-            }
+            Tensor ctx_h0(ctx_h_base + 0 * ctx_h_bytes, DType::BF16, {kHiddenSize, total_count});
+            Tensor ctx_h1(ctx_h_base + 1 * ctx_h_bytes, DType::BF16, {kHiddenSize, total_count});
+            Tensor ctx_h2(ctx_h_base + 2 * ctx_h_bytes, DType::BF16, {kHiddenSize, total_count});
+            Tensor kv_ctx0(kv_ctx_base + 0 * kv_ctx_bytes, DType::BF16, {kv2_dim, total_count});
+            Tensor kv_ctx1(kv_ctx_base + 1 * kv_ctx_bytes, DType::BF16, {kv2_dim, total_count});
+            Tensor kv_ctx2(kv_ctx_base + 2 * kv_ctx_bytes, DType::BF16, {kv2_dim, total_count});
 
-            ops::inkling2_mtp_mix_rmsnorm_indexed(
-                rs.mtp_target_caps,
-                static_cast<const std::int32_t*>(rs.round_mtp_last_src.data),
+            const auto& ml0 = rs.model->mtp.layers[0];
+            const auto& ml1 = rs.model->mtp.layers[1];
+            const auto& ml2 = rs.model->mtp.layers[2];
+
+            // 10 launches -> 3 launches: fused 3-layer+f_rnn mix -> triple kv_ctx linear -> fused 3-layer KV write!
+            ops::inkling2_mtp_mix_rmsnorm_batch3_and_frnn(
+                rs.mtp_target_caps, static_cast<const std::int32_t*>(rs.round_mtp_src_idx.data),
+                total_count, static_cast<const std::int32_t*>(rs.round_mtp_last_src.data),
                 static_cast<const std::int32_t*>(rs.round_mtp_last_dst.data), active_lanes,
-                rs.model->mtp.fuse_weight, 3, rs.model->mtp.markov_dflare_norm, kRmsNormEps,
-                rs.mtp_f_rnn, s);
+                rs.model->mtp.fuse_weight, ml0.dflare_norm, ml1.dflare_norm, ml2.dflare_norm,
+                rs.model->mtp.markov_dflare_norm, kRmsNormEps, ctx_h0, ctx_h1, ctx_h2, rs.mtp_f_rnn,
+                s);
+            ops::inkling2_bf16_linear_triple(ctx_h0, ml0.kv_ctx, kv_ctx0,
+                                             ctx_h1, ml1.kv_ctx, kv_ctx1,
+                                             ctx_h2, ml2.kv_ctx, kv_ctx2, s);
+            ops::inkling2_mtp_ctx_kv_write_3(
+                kv_ctx0, ml0.k_norm_ctx, make_mtp_kv_target(rs, 0),
+                kv_ctx1, ml1.k_norm_ctx, make_mtp_kv_target(rs, 1),
+                kv_ctx2, ml2.k_norm_ctx, make_mtp_kv_target(rs, 2),
+                static_cast<const std::int32_t*>(rs.round_positions.data),
+                static_cast<const std::int32_t*>(rs.round_tok_lanes.data), total_count,
+                rs.model->num_kv_heads, kMtpRopeTheta, kRmsNormEps, s);
         }
         CUDA_CHECK(cudaSetDevice(ec_.primary().device));
     }
@@ -2013,6 +2100,11 @@ private:
             ar_b_pair[r] = Tensor(ranks_[static_cast<std::size_t>(r)].ar_staging.data, DType::BF16,
                                   {kHiddenSize, B});
         }
+
+        const bool can_fuse_mtp_tp2_ar_res =
+            (tp_ == 2 && peer_events_.has_value() && peer_events_->packet_storage(0) != nullptr &&
+             attn_pair[0].bytes() <= peer_events_->packet_capacity_bytes() &&
+             (attn_pair[0].bytes() % 16 == 0));
 
         // 1. Anchor embedding + AllReduce + embed_norm -> build block [anchor, mask, ..., mask]
         for (int r = 0; r < tp_; ++r) {
@@ -2063,10 +2155,23 @@ private:
                     q_t, kb_t, vb_t, make_mtp_kv_target(rs, li),
                     static_cast<const std::int32_t*>(rs.round_batch_lanes.data),
                     static_cast<const std::int32_t*>(rs.round_ctx_lens.data), B, blk,
-                    rs.model->num_q_heads, rs.model->num_kv_heads, kSwaWindow, aval_t, s);
+                    rs.model->num_q_heads, rs.model->num_kv_heads, kSwaWindow, aval_t, s,
+                    static_cast<float*>(rs.split_scratch.data), 16, rs.attn_split_done);
                 ops::inkling2_bf16_linear(aval_t, ml.o_proj, attn_pair[r], s);
             }
-            allreduce_bf16(attn_pair, ar_pair);
+            if (can_fuse_mtp_tp2_ar_res) {
+                for (int r = 0; r < 2; ++r) {
+                    auto& rs = ranks_[static_cast<std::size_t>(r)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    Tensor h_t(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
+                    ops::inkling2_tp2_packet_allreduce_residual(
+                        attn_pair[r], peer_events_->packet_storage(r),
+                        peer_events_->packet_storage(1 - r), peer_events_->packet_capacity_bytes(),
+                        h_t, rs.dev->stream);
+                }
+            } else {
+                allreduce_bf16(attn_pair, ar_pair);
+            }
 
             for (int r = 0; r < tp_; ++r) {
                 auto& rs       = ranks_[static_cast<std::size_t>(r)];
@@ -2079,23 +2184,34 @@ private:
                 Tensor gu_t(rs.mtp_gate_up.data, DType::BF16, {(2 * kMtpInterSize) / tp_, blk_T});
                 Tensor act_t(rs.mtp_mlp_act.data, DType::BF16, {kMtpInterSize / tp_, blk_T});
 
-                ops::residual_add(attn_pair[r], h_t, s);
+                if (!can_fuse_mtp_tp2_ar_res) { ops::residual_add(attn_pair[r], h_t, s); }
                 ops::inkling2_rmsnorm(h_t, &ml.post_attention_norm, norm_t, kRmsNormEps, s);
                 ops::inkling2_bf16_linear(norm_t, ml.gate_up, gu_t, s);
                 ops::inkling2_silu_mul_packed(gu_t, act_t, s);
                 ops::inkling2_bf16_linear(act_t, ml.down_proj, mlp_pair[r], s);
             }
-            allreduce_bf16(mlp_pair, ar_pair);
-
-            for (int r = 0; r < tp_; ++r) {
-                auto& rs = ranks_[static_cast<std::size_t>(r)];
-                CUDA_CHECK(cudaSetDevice(rs.dev->device));
-                Tensor h_t(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
-                ops::residual_add(mlp_pair[r], h_t, rs.dev->stream);
+            if (can_fuse_mtp_tp2_ar_res) {
+                for (int r = 0; r < 2; ++r) {
+                    auto& rs = ranks_[static_cast<std::size_t>(r)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    Tensor h_t(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
+                    ops::inkling2_tp2_packet_allreduce_residual(
+                        mlp_pair[r], peer_events_->packet_storage(r),
+                        peer_events_->packet_storage(1 - r), peer_events_->packet_capacity_bytes(),
+                        h_t, rs.dev->stream);
+                }
+            } else {
+                allreduce_bf16(mlp_pair, ar_pair);
+                for (int r = 0; r < tp_; ++r) {
+                    auto& rs = ranks_[static_cast<std::size_t>(r)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    Tensor h_t(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
+                    ops::residual_add(mlp_pair[r], h_t, rs.dev->stream);
+                }
             }
         }
 
-        // 3. Final MTP norm + batched base_logits = h_draft[1..D] @ output_head^T + zero RNN state
+        // 3. Fused Final MTP norm + extract draft_h + zero RNN state slot 0, then batched base_logits
         for (int r = 0; r < tp_; ++r) {
             auto& rs       = ranks_[static_cast<std::size_t>(r)];
             cudaStream_t s = rs.dev->stream;
@@ -2104,18 +2220,16 @@ private:
             Tensor h_t(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
             Tensor draft_h(rs.mtp_draft_h.data, DType::BF16, {kHiddenSize, drf_T});
             Tensor base_log(rs.mtp_base_logits.data, DType::BF16, {rs.model->vocab_rows, drf_T});
+            Tensor st_slot0(rs.mtp_rnn_state.data, DType::BF16, {kMtpMarkovRank, B});
 
-            ops::inkling2_rmsnorm(h_t, &rs.model->mtp.final_norm, h_t, kRmsNormEps, s);
-            ops::inkling2_mtp_extract_draft_hiddens(h_t, B, blk, draft_h, s);
+            ops::inkling2_mtp_final_norm_extract_zero(h_t, rs.model->mtp.final_norm, kRmsNormEps, B,
+                                                      blk, draft_h, st_slot0, s);
             ops::inkling2_bf16_linear(draft_h, rs.model->output_head, base_log, s);
-            CUDA_CHECK(cudaMemsetAsync(rs.mtp_rnn_state.data, 0,
-                                       static_cast<std::size_t>(B) * kMtpMarkovRank * 2, s));
         }
 
-        // 4. Autoregressive Folded Markov RNN (D steps: 0 .. D-1)
-        // Note: `mtp_f_rnn` is indexed by `lane`! Copy compact batch f_rnn into `mtp_anchor_emb` (reuse [H, B]!)
-        // Actually: for B==1 or arbitrary lanes, let's copy per-batch f_rnn on host before launching the graph!
-        // Here `mtp_anchor_emb` is overwritten in step 1, so we use `cur` [H, B] (already free!) to hold compact f_rnn!
+        // 4. Autoregressive Folded Markov RNN (D steps: 0 .. D-1) using fused ping-pong step!
+        // `cur` [H, B] holds compact batch f_rnn staged before graph launch.
+        const std::size_t rnn_slot_bytes = static_cast<std::size_t>(B) * kMtpMarkovRank * 2;
         for (int step = 0; step < D; ++step) {
             std::array<Tensor, 2> vals{}, ids{}, outs{};
             for (int r = 0; r < tp_; ++r) {
@@ -2123,7 +2237,11 @@ private:
                 cudaStream_t s = rs.dev->stream;
                 CUDA_CHECK(cudaSetDevice(rs.dev->device));
 
-                Tensor st_t(rs.mtp_rnn_state.data, DType::BF16, {kMtpMarkovRank, B});
+                auto* st_base = static_cast<std::byte*>(rs.mtp_rnn_state.data);
+                Tensor st_in(st_base + static_cast<std::size_t>(step & 1) * rnn_slot_bytes,
+                             DType::BF16, {kMtpMarkovRank, B});
+                Tensor st_out(st_base + static_cast<std::size_t>((step + 1) & 1) * rnn_slot_bytes,
+                              DType::BF16, {kMtpMarkovRank, B});
                 Tensor prev_t((step == 0) ? rs.round_anchor_ids.data
                                           : static_cast<void*>(
                                                 static_cast<std::int32_t*>(rs.round_draft_out.data) +
@@ -2131,15 +2249,12 @@ private:
                               DType::I32, {B});
                 Tensor h_blk(rs.mtp_h.data, DType::BF16, {kHiddenSize, blk_T});
                 Tensor frnn_b(rs.cur.data, DType::BF16, {kHiddenSize, B});
-                Tensor z_t(rs.mtp_rnn_z.data, DType::BF16, {2 * kMtpMarkovRank + 2 * kHiddenSize, B});
-                Tensor proj_t(rs.mtp_rnn_proj.data, DType::BF16, {3 * kMtpMarkovRank, B});
                 Tensor lat_t(rs.mtp_rnn_latent.data, DType::BF16, {kMtpMarkovRank, B});
 
-                ops::inkling2_mtp_markov_rnn_prep(st_t, prev_t, rs.model->mtp.markov_w1, h_blk,
-                                                  step + 1, blk, frnn_b, z_t, s);
-                ops::inkling2_bf16_linear(z_t, rs.model->mtp.markov_rnn_proj_weight, proj_t, s,
-                                          &rs.model->mtp.markov_rnn_proj_bias);
-                ops::inkling2_mtp_markov_rnn_gates(proj_t, st_t, lat_t, s);
+                ops::inkling2_mtp_markov_rnn_step(
+                    st_in, prev_t, rs.model->mtp.markov_w1, h_blk, step + 1, blk, frnn_b,
+                    rs.model->mtp.markov_rnn_proj_weight, rs.model->mtp.markov_rnn_proj_bias,
+                    st_out, lat_t, s);
 
                 // Strided Markov logits argmax directly on mtp_base_logits [vocab_rows, B * D] -> ZERO D2D copies!
                 Tensor base_all(rs.mtp_base_logits.data, DType::BF16,

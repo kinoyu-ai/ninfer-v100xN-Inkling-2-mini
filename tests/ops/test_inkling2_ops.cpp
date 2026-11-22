@@ -378,6 +378,75 @@ void test_bf16_linear_and_heads(cudaStream_t stream) {
         check_close(lbl, ref0, to_f64_from_bf16(do0.download<std::uint16_t>(t * n0)), 3e-2, 2e-2);
         check_close(lbl, ref1, to_f64_from_bf16(do1.download<std::uint16_t>(t * n1)), 3e-2, 2e-2);
     }
+
+    // 5-way BF16 Linear (Wave 4.5 fused global-layer projection across T=1, 4, 8, 16, 20)
+    for (int t : {1, 4, 8, 16, 20}) {
+        const int k = 256;
+        const int ns[5] = {160, 32, 48, 16, 16};
+        std::vector<std::vector<std::uint16_t>> hx(5), hw(5);
+        std::vector<DevBuf> dx, dw, dout;
+        for (int s = 0; s < 5; ++s) {
+            hx[s] = rand_bf16(rng, t * k, 0.25f);
+            hw[s] = rand_bf16(rng, ns[s] * k, 0.25f);
+            dx.emplace_back(hx[s].size() * 2); dx.back().upload(hx[s]);
+            dw.emplace_back(hw[s].size() * 2); dw.back().upload(hw[s]);
+            dout.emplace_back(t * ns[s] * 2);
+        }
+        Tensor tx0 = make_t(dx[0].ptr, DType::BF16, k, t), tw0 = make_t(dw[0].ptr, DType::BF16, k, ns[0]), to0 = make_t(dout[0].ptr, DType::BF16, ns[0], t);
+        Tensor tx1 = make_t(dx[1].ptr, DType::BF16, k, t), tw1 = make_t(dw[1].ptr, DType::BF16, k, ns[1]), to1 = make_t(dout[1].ptr, DType::BF16, ns[1], t);
+        Tensor tx2 = make_t(dx[2].ptr, DType::BF16, k, t), tw2 = make_t(dw[2].ptr, DType::BF16, k, ns[2]), to2 = make_t(dout[2].ptr, DType::BF16, ns[2], t);
+        Tensor tx3 = make_t(dx[3].ptr, DType::BF16, k, t), tw3 = make_t(dw[3].ptr, DType::BF16, k, ns[3]), to3 = make_t(dout[3].ptr, DType::BF16, ns[3], t);
+        Tensor tx4 = make_t(dx[4].ptr, DType::BF16, k, t), tw4 = make_t(dw[4].ptr, DType::BF16, k, ns[4]), to4 = make_t(dout[4].ptr, DType::BF16, ns[4], t);
+        ops::inkling2_bf16_linear_5way(tx0, tw0, to0, tx1, tw1, to1, tx2, tw2, to2, tx3, tw3, to3,
+                                       tx4, tw4, to4, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int s = 0; s < 5; ++s) {
+            std::vector<double> ref(t * ns[s], 0.0);
+            for (int ti = 0; ti < t; ++ti)
+                for (int ni = 0; ni < ns[s]; ++ni)
+                    for (int ki = 0; ki < k; ++ki)
+                        ref[ti * ns[s] + ni] += static_cast<double>(bf16_to_f32(hx[s][ti * k + ki])) *
+                                                static_cast<double>(bf16_to_f32(hw[s][ni * k + ki]));
+            char lbl[64];
+            std::snprintf(lbl, sizeof(lbl), "bf16_linear_5way T=%d seg=%d", t, s);
+            check_close(lbl, ref, to_f64_from_bf16(dout[s].download<std::uint16_t>(t * ns[s])), 3e-2, 2e-2);
+        }
+    }
+
+    // Wave 4 fused argmax-only unembed_project (logits_out == nullptr, T=1, 4, 8)
+    for (int t : {1, 4, 8}) {
+        const int n = 4096, k = 256, valid = 4000;
+        const float softcap = 30.0f;
+        auto hx = rand_bf16(rng, t * k, 0.5f);
+        auto hw = rand_bf16(rng, n * k, 0.5f);
+        DevBuf dx(hx.size() * 2), dw(hw.size() * 2), dv(t * 4), di(t * 4);
+        dx.upload(hx); dw.upload(hw);
+        Tensor tx = make_t(dx.ptr, DType::BF16, k, t);
+        Tensor tw = make_t(dw.ptr, DType::BF16, k, n);
+        Tensor tv = make_t(dv.ptr, DType::FP32, t);
+        Tensor ti = make_t(di.ptr, DType::I32, t);
+        ops::inkling2_unembed_project(tx, tw, softcap, valid, nullptr, &tv, &ti, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto gval = dv.download<float>(t);
+        auto gid  = di.download<std::int32_t>(t);
+        for (int row = 0; row < t; ++row) {
+            double best_v = -1e30;
+            int best_id   = -1;
+            for (int col = 0; col < valid; ++col) {
+                double acc = 0.0;
+                for (int ki = 0; ki < k; ++ki) {
+                    acc += static_cast<double>(bf16_to_f32(hx[row * k + ki])) *
+                           static_cast<double>(bf16_to_f32(hw[col * k + ki]));
+                }
+                double v = softcap * std::tanh(acc / softcap);
+                if (v > best_v) { best_v = v; best_id = col; }
+            }
+            if (gid[row] != best_id || std::abs(gval[row] - best_v) > 3e-2) {
+                throw std::runtime_error("unembed argmax-only mismatch");
+            }
+        }
+        std::printf("  [PASS] unembed_project argmax-only T=%d (pf2)\n", t);
+    }
 }
 
 // ============================================================================
@@ -610,6 +679,136 @@ void test_norms_attnres_controller(cudaStream_t stream) {
                         to_f64_from_bf16(do_qkv[c].download<std::uint16_t>(t_case * H)), 1e-2, 1e-2);
         }
     }
+
+    // Wave 3/4: attn_res_mix_and_prep + loop_control(skip_prep=true),
+    // attn_res_mix_pair_and_prep_qkv + loop_control_qkv(skip_prep=true), and swap_pass_banks
+    for (int t_case : {1, 4}) {
+        const int S = 4;
+        std::vector<std::vector<std::uint16_t>> hsrc(S);
+        std::vector<DevBuf> dsrc;
+        std::vector<const void*> sptrs(S);
+        for (int s = 0; s < S; ++s) {
+            hsrc[s] = rand_bf16(rng, t_case * H, 0.8f);
+            dsrc.emplace_back(hsrc[s].size() * 2); dsrc.back().upload(hsrc[s]);
+            sptrs[s] = dsrc.back().ptr;
+        }
+        auto hq   = rand_f32(rng, H, 0.7f);
+        auto hmsg = rand_bf16(rng, t_case * H, 0.8f);
+        auto hdn  = rand_bf16(rng, 64 * 2 * H, 0.1f);
+        auto hgf  = rand_bf16(rng, 2 * H * 64, 0.1f);
+        auto hnw  = rand_bf16(rng, H, 1.0f);
+        DevBuf dq(H * 4), dmsg(hmsg.size() * 2), ddn(hdn.size() * 2), dgf(hgf.size() * 2), dnw(H * 2);
+        DevBuf dmix_r(t_case * H * 2), dmix_f(t_case * H * 2);
+        DevBuf dz_r(t_case * 2 * H * 2), dz_f(t_case * 2 * H * 2), dh(t_case * 64 * 2), dgf_s(t_case * 2 * H * 2);
+        DevBuf do_r(t_case * H * 2), do_f(t_case * H * 2);
+        dq.upload(hq); dmsg.upload(hmsg); ddn.upload(hdn); dgf.upload(hgf); dnw.upload(hnw);
+        Tensor tq = make_t(dq.ptr, DType::FP32, H, 1), tmsg = make_t(dmsg.ptr, DType::BF16, H, t_case);
+        Tensor tdn = make_t(ddn.ptr, DType::BF16, 2 * H, 64), tgf = make_t(dgf.ptr, DType::BF16, 64, 2 * H);
+        Tensor tnw = make_t(dnw.ptr, DType::BF16, H);
+        Tensor tmr = make_t(dmix_r.ptr, DType::BF16, H, t_case), tmf = make_t(dmix_f.ptr, DType::BF16, H, t_case);
+        Tensor tzr = make_t(dz_r.ptr, DType::BF16, 2 * H, t_case), tzf = make_t(dz_f.ptr, DType::BF16, 2 * H, t_case);
+        Tensor th = make_t(dh.ptr, DType::BF16, 64, t_case), tgfs = make_t(dgf_s.ptr, DType::BF16, 2 * H, t_case);
+        Tensor tor = make_t(do_r.ptr, DType::BF16, H, t_case), tof = make_t(do_f.ptr, DType::BF16, H, t_case);
+
+        const void* null_nw[1] = {nullptr};
+        void* out_r[1]         = {dmix_r.ptr};
+        ops::inkling2_attn_res_mix(sptrs.data(), S, tq, null_nw, out_r, 1, H, t_case, eps, stream);
+        ops::inkling2_loop_control(tmr, tmsg, tdn, tgf, &tnw, tzr, th, tgfs, tor, eps, stream, false);
+
+        ops::inkling2_attn_res_mix_and_prep(sptrs.data(), S, tq, tmsg, tmf, tzf, eps, stream);
+        ops::inkling2_loop_control(tmf, tmsg, tdn, tgf, &tnw, tzf, th, tgfs, tof, eps, stream, true);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        char lbl[96];
+        std::snprintf(lbl, sizeof(lbl), "attn_res_mix_and_prep + loop_ctrl(skip_prep) T=%d", t_case);
+        check_close(lbl, to_f64_from_bf16(dmix_r.download<std::uint16_t>(t_case * H)),
+                    to_f64_from_bf16(dmix_f.download<std::uint16_t>(t_case * H)), 1e-2, 1e-2);
+        check_close(lbl, to_f64_from_bf16(do_r.download<std::uint16_t>(t_case * H)),
+                    to_f64_from_bf16(do_f.download<std::uint16_t>(t_case * H)), 1.5e-2, 1.5e-2);
+
+        // Paired Cross-Pass AttnRes + QKV Prep (both num_cur_q=1 and num_cur_q=3)
+        for (int n_cur_q : {1, 3}) {
+            const int S0 = 2, Q0 = 4, S1 = 3;
+            auto hq0 = rand_f32(rng, Q0 * H, 0.7f), hq1 = rand_f32(rng, n_cur_q * H, 0.7f);
+            DevBuf dq0(hq0.size() * 4), dq1(hq1.size() * 4);
+            dq0.upload(hq0); dq1.upload(hq1);
+            Tensor tq0 = make_t(dq0.ptr, DType::FP32, H, Q0), tq1 = make_t(dq1.ptr, DType::FP32, H, n_cur_q);
+
+            std::vector<DevBuf> dmsg_r, dmsg_f, dcur_r, dcur_f, ddn3, dgf3, dnw3, dor3, dof3;
+            void* mp_r[4]; void* mp_f[4]; void* cp_r[3]; void* cp_f[3];
+            const void* nn1[3] = {nullptr, nullptr, nullptr};
+            for (int i = 0; i < 4; ++i) {
+                dmsg_r.emplace_back(t_case * H * 2); mp_r[i] = dmsg_r.back().ptr;
+                dmsg_f.emplace_back(t_case * H * 2); mp_f[i] = dmsg_f.back().ptr;
+            }
+            for (int i = 0; i < 3; ++i) {
+                dcur_r.emplace_back(t_case * H * 2); cp_r[i] = dcur_r.back().ptr;
+                dcur_f.emplace_back(t_case * H * 2); cp_f[i] = dcur_f.back().ptr;
+                auto d_w = rand_bf16(rng, 64 * 2 * H, 0.1f), g_w = rand_bf16(rng, 2 * H * 64, 0.1f), n_w = rand_bf16(rng, H, 1.0f);
+                ddn3.emplace_back(d_w.size() * 2); ddn3.back().upload(d_w);
+                dgf3.emplace_back(g_w.size() * 2); dgf3.back().upload(g_w);
+                dnw3.emplace_back(n_w.size() * 2); dnw3.back().upload(n_w);
+                dor3.emplace_back(t_case * H * 2);
+                dof3.emplace_back(t_case * H * 2);
+            }
+            DevBuf dz3r(3 * t_case * 2 * H * 2), dz3f(3 * t_case * 2 * H * 2);
+            DevBuf dh3(3 * t_case * 64 * 2), dgf3s(3 * t_case * 2 * H * 2);
+            Tensor tz3r = make_t(dz3r.ptr, DType::BF16, 2 * H, 3 * t_case);
+            Tensor tz3f = make_t(dz3f.ptr, DType::BF16, 2 * H, 3 * t_case);
+            Tensor th3  = make_t(dh3.ptr, DType::BF16, 64, 3 * t_case);
+            Tensor tgf3s = make_t(dgf3s.ptr, DType::BF16, 2 * H, 3 * t_case);
+
+            const void* bank_srcs[2] = {sptrs[0], sptrs[1]};
+            const void* cur_srcs[3]  = {sptrs[0], sptrs[1], sptrs[2]};
+            ops::inkling2_attn_res_mix_pair(bank_srcs, S0, tq0, mp_r, Q0, cur_srcs, S1, tq1, nn1,
+                                            cp_r, n_cur_q, H, t_case, eps, stream);
+            Tensor tc0r = make_t(cp_r[0], DType::BF16, H, t_case),
+                   tc1r = make_t(cp_r[n_cur_q == 1 ? 0 : 1], DType::BF16, H, t_case),
+                   tc2r = make_t(cp_r[n_cur_q == 1 ? 0 : 2], DType::BF16, H, t_case);
+            Tensor tm0r = make_t(mp_r[0], DType::BF16, H, t_case), tm1r = make_t(mp_r[1], DType::BF16, H, t_case), tm2r = make_t(mp_r[2], DType::BF16, H, t_case);
+            Tensor td0 = make_t(ddn3[0].ptr, DType::BF16, 2 * H, 64), td1 = make_t(ddn3[1].ptr, DType::BF16, 2 * H, 64), td2 = make_t(ddn3[2].ptr, DType::BF16, 2 * H, 64);
+            Tensor tf0 = make_t(dgf3[0].ptr, DType::BF16, 64, 2 * H), tf1 = make_t(dgf3[1].ptr, DType::BF16, 64, 2 * H), tf2 = make_t(dgf3[2].ptr, DType::BF16, 64, 2 * H);
+            Tensor tn0 = make_t(dnw3[0].ptr, DType::BF16, H), tn1 = make_t(dnw3[1].ptr, DType::BF16, H), tn2 = make_t(dnw3[2].ptr, DType::BF16, H);
+            Tensor to0r = make_t(dor3[0].ptr, DType::BF16, H, t_case), to1r = make_t(dor3[1].ptr, DType::BF16, H, t_case), to2r = make_t(dor3[2].ptr, DType::BF16, H, t_case);
+            ops::inkling2_loop_control_qkv(tc0r, tc1r, tc2r, tm0r, tm1r, tm2r, td0, td1, td2,
+                                           tf0, tf1, tf2, &tn0, &tn1, &tn2, tz3r, th3, tgf3s,
+                                           to0r, to1r, to2r, eps, stream, false);
+
+            ops::inkling2_attn_res_mix_pair_and_prep_qkv(bank_srcs, tq0, mp_f, cur_srcs, S1, tq1,
+                                                         cp_f, n_cur_q, tz3f, eps, stream);
+            Tensor tc0f = make_t(cp_f[0], DType::BF16, H, t_case),
+                   tc1f = make_t(cp_f[n_cur_q == 1 ? 0 : 1], DType::BF16, H, t_case),
+                   tc2f = make_t(cp_f[n_cur_q == 1 ? 0 : 2], DType::BF16, H, t_case);
+            Tensor tm0f = make_t(mp_f[0], DType::BF16, H, t_case), tm1f = make_t(mp_f[1], DType::BF16, H, t_case), tm2f = make_t(mp_f[2], DType::BF16, H, t_case);
+            Tensor to0f = make_t(dof3[0].ptr, DType::BF16, H, t_case), to1f = make_t(dof3[1].ptr, DType::BF16, H, t_case), to2f = make_t(dof3[2].ptr, DType::BF16, H, t_case);
+            ops::inkling2_loop_control_qkv(tc0f, tc1f, tc2f, tm0f, tm1f, tm2f, td0, td1, td2,
+                                           tf0, tf1, tf2, &tn0, &tn1, &tn2, tz3f, th3, tgf3s,
+                                           to0f, to1f, to2f, eps, stream, true);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (int c = 0; c < 3; ++c) {
+                std::snprintf(lbl, sizeof(lbl), "attn_res_pair_prep_qkv T=%d Q1=%d c=%d", t_case, n_cur_q, c);
+                check_close(lbl, to_f64_from_bf16(dor3[c].download<std::uint16_t>(t_case * H)),
+                            to_f64_from_bf16(dof3[c].download<std::uint16_t>(t_case * H)), 1.5e-2, 1.5e-2);
+            }
+        }
+    }
+
+    // Wave 4: swap_pass_banks bit-exact copy
+    {
+        auto hsb0 = rand_bf16(rng, 4 * H, 1.0f), hpre = rand_bf16(rng, 4 * H, 1.0f), hcur = rand_bf16(rng, 4 * H, 1.0f);
+        DevBuf dsb0(hsb0.size() * 2), dpre(hpre.size() * 2), dcur(hcur.size() * 2), db0(hcur.size() * 2), dbout(hcur.size() * 2);
+        dsb0.upload(hsb0); dpre.upload(hpre); dcur.upload(hcur);
+        db0.zero(); dbout.zero();
+        Tensor tsb0 = make_t(dsb0.ptr, DType::BF16, H, 4), tpre = make_t(dpre.ptr, DType::BF16, H, 4);
+        Tensor tcur = make_t(dcur.ptr, DType::BF16, H, 4), tb0 = make_t(db0.ptr, DType::BF16, H, 4), tbout = make_t(dbout.ptr, DType::BF16, H, 4);
+        ops::inkling2_swap_pass_banks(tsb0, tpre, tcur, tb0, tbout, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (db0.download<std::uint16_t>(4 * H) != hsb0 ||
+            dbout.download<std::uint16_t>(4 * H) != hcur ||
+            dcur.download<std::uint16_t>(4 * H) != hpre) {
+            throw std::runtime_error("swap_pass_banks mismatch");
+        }
+        std::printf("  [PASS] swap_pass_banks exact\n");
+    }
 }
 
 // ============================================================================
@@ -760,6 +959,140 @@ void test_sconv(cudaStream_t stream) {
         check_close("sconv_kv_dynamic_verify K exact", to_f64_from_bf16(dok_ref.download<std::uint16_t>(hk.size())), to_f64_from_bf16(dok_pair.download<std::uint16_t>(hk.size())), 0.0, 0.0);
         check_close("sconv_kv_dynamic_verify V exact", to_f64_from_bf16(dov_ref.download<std::uint16_t>(hv.size())), to_f64_from_bf16(dov_pair.download<std::uint16_t>(hv.size())), 0.0, 0.0);
     }
+
+    // Fused TP2 Packet AllReduce + Static SConv (Decode & Verify, BF16 & FP32) + Packet AR Residual
+    // Verified via single-GPU two-epoch loopback mailbox (local == peer -> exact bf16(2*x)), 2 consecutive rounds!
+    {
+        const int Hc = 2304, B = 2, V = 4;
+        const std::size_t epoch_bytes = 64 * 1024;
+        const std::size_t mbox_bytes  = 2 * epoch_bytes + 4096;
+        DevBuf mbox(mbox_bytes);
+        CUDA_CHECK(cudaMemsetAsync(mbox.ptr, 0xFF, 2 * epoch_bytes, stream));
+        CUDA_CHECK(cudaMemsetAsync(static_cast<char*>(mbox.ptr) + 2 * epoch_bytes, 0, 4096, stream));
+
+        auto hw_h   = rand_bf16(rng, Hc * 4, 0.4f);
+        auto hres_d = rand_bf16(rng, B * Hc, 0.5f);
+        auto hbc_d  = rand_bf16(rng, B * Hc, 0.6f);
+        DevBuf dw_h(hw_h.size() * 2), dres_d(hres_d.size() * 2), dbc_src(hbc_d.size() * 2), dbc_dst(hbc_d.size() * 2);
+        dw_h.upload(hw_h); dres_d.upload(hres_d); dbc_src.upload(hbc_d);
+        std::vector<std::int32_t> hlanes = {0, 1};
+        DevBuf dlanes(B * 4); dlanes.upload(hlanes);
+        const std::size_t stride = 3 * Hc;
+        DevBuf dst_ref(B * stride * 4), dst_pkt(B * stride * 4);
+        dst_ref.zero(); dst_pkt.zero();
+
+        Tensor tw_h   = make_t(dw_h.ptr, DType::BF16, 4, Hc);
+        Tensor tres_d = make_t(dres_d.ptr, DType::BF16, Hc, B);
+        Tensor tbc_s  = make_t(dbc_src.ptr, DType::BF16, Hc, B);
+        Tensor tbc_d  = make_t(dbc_dst.ptr, DType::BF16, Hc, B);
+
+        // Decode BF16 & FP32 across 2 consecutive epochs
+        for (int ep = 0; ep < 2; ++ep) {
+            const bool is_f32 = (ep == 1);
+            auto hpart_f32    = rand_f32(rng, B * Hc, 0.4f);
+            std::vector<std::uint16_t> hpart_bf16(B * Hc), hsum_bf16(B * Hc);
+            for (int i = 0; i < B * Hc; ++i) {
+                hpart_bf16[i] = f32_to_bf16(hpart_f32[i]);
+                float v       = bf16_to_f32(hpart_bf16[i]);
+                hsum_bf16[i]  = f32_to_bf16(v + v);
+            }
+            DevBuf dpart(is_f32 ? B * Hc * 4 : B * Hc * 2), dsum(B * Hc * 2);
+            DevBuf do_ref(B * Hc * 2), do_pkt(B * Hc * 2);
+            if (is_f32) { dpart.upload(hpart_f32); } else { dpart.upload(hpart_bf16); }
+            dsum.upload(hsum_bf16);
+            dbc_dst.zero();
+            Tensor tpart = make_t(dpart.ptr, is_f32 ? DType::FP32 : DType::BF16, Hc, B);
+            Tensor tsum  = make_t(dsum.ptr, DType::BF16, Hc, B);
+            Tensor to_r  = make_t(do_ref.ptr, DType::BF16, Hc, B);
+            Tensor to_p  = make_t(do_pkt.ptr, DType::BF16, Hc, B);
+
+            ops::inkling2_sconv_static_decode(tsum, tw_h, static_cast<float*>(dst_ref.ptr),
+                                              static_cast<const std::int32_t*>(dlanes.ptr), B, to_r,
+                                              &tres_d, stream, stride);
+            ops::inkling2_tp2_packet_allreduce_sconv_decode(
+                tpart, mbox.ptr, mbox.ptr, epoch_bytes, tw_h, static_cast<float*>(dst_pkt.ptr),
+                static_cast<const std::int32_t*>(dlanes.ptr), B, stride, to_p, &tres_d, &tbc_s,
+                &tbc_d, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            check_close(is_f32 ? "tp2_packet_ar_sconv_decode FP32 exact"
+                               : "tp2_packet_ar_sconv_decode BF16 exact",
+                        to_f64_from_bf16(do_ref.download<std::uint16_t>(B * Hc)),
+                        to_f64_from_bf16(do_pkt.download<std::uint16_t>(B * Hc)), 0.0, 0.0);
+            if (dbc_dst.download<std::uint16_t>(B * Hc) != hbc_d) {
+                throw std::runtime_error("tp2_packet_ar_sconv_decode block_copy mismatch");
+            }
+        }
+
+        // Verify BF16 & FP32 across 2 consecutive epochs
+        auto hres_v = rand_bf16(rng, B * V * Hc, 0.5f);
+        auto hbc_v  = rand_bf16(rng, B * V * Hc, 0.6f);
+        DevBuf dres_v(hres_v.size() * 2), dbc_vs(hbc_v.size() * 2), dbc_vd(hbc_v.size() * 2);
+        dres_v.upload(hres_v); dbc_vs.upload(hbc_v);
+        DevBuf dv_ref(B * V * stride * 4), dv_pkt(B * V * stride * 4);
+        Tensor tres_v = make_t(dres_v.ptr, DType::BF16, Hc, B * V);
+        Tensor tbv_s  = make_t(dbc_vs.ptr, DType::BF16, Hc, B * V);
+        Tensor tbv_d  = make_t(dbc_vd.ptr, DType::BF16, Hc, B * V);
+        for (int ep = 0; ep < 2; ++ep) {
+            const bool is_f32 = (ep == 1);
+            auto hpart_f32    = rand_f32(rng, B * V * Hc, 0.4f);
+            std::vector<std::uint16_t> hpart_bf16(B * V * Hc), hsum_bf16(B * V * Hc);
+            for (int i = 0; i < B * V * Hc; ++i) {
+                hpart_bf16[i] = f32_to_bf16(hpart_f32[i]);
+                float v       = bf16_to_f32(hpart_bf16[i]);
+                hsum_bf16[i]  = f32_to_bf16(v + v);
+            }
+            DevBuf dpart(is_f32 ? B * V * Hc * 4 : B * V * Hc * 2), dsum(B * V * Hc * 2);
+            DevBuf do_ref(B * V * Hc * 2), do_pkt(B * V * Hc * 2);
+            if (is_f32) { dpart.upload(hpart_f32); } else { dpart.upload(hpart_bf16); }
+            dsum.upload(hsum_bf16);
+            dv_ref.zero(); dv_pkt.zero(); dbc_vd.zero();
+            Tensor tpart = make_t(dpart.ptr, is_f32 ? DType::FP32 : DType::BF16, Hc, B * V);
+            Tensor tsum  = make_t(dsum.ptr, DType::BF16, Hc, B * V);
+            Tensor to_r  = make_t(do_ref.ptr, DType::BF16, Hc, B * V);
+            Tensor to_p  = make_t(do_pkt.ptr, DType::BF16, Hc, B * V);
+
+            ops::inkling2_sconv_static_verify(tsum, tw_h, static_cast<const float*>(dst_ref.ptr),
+                                              static_cast<float*>(dv_ref.ptr),
+                                              static_cast<const std::int32_t*>(dlanes.ptr), B, V,
+                                              to_r, &tres_v, stream, stride, V);
+            ops::inkling2_tp2_packet_allreduce_sconv_verify(
+                tpart, mbox.ptr, mbox.ptr, epoch_bytes, tw_h, static_cast<const float*>(dst_pkt.ptr),
+                static_cast<float*>(dv_pkt.ptr), static_cast<const std::int32_t*>(dlanes.ptr), B, V,
+                stride, V, to_p, &tres_v, &tbv_s, &tbv_d, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            check_close(is_f32 ? "tp2_packet_ar_sconv_verify FP32"
+                               : "tp2_packet_ar_sconv_verify BF16",
+                        to_f64_from_bf16(do_ref.download<std::uint16_t>(B * V * Hc)),
+                        to_f64_from_bf16(do_pkt.download<std::uint16_t>(B * V * Hc)), 1e-3, 1e-2);
+            check_close("tp2_packet_ar_sconv_verify state exact",
+                        to_f64_from_f32(dv_ref.download<float>(B * V * stride)),
+                        to_f64_from_f32(dv_pkt.download<float>(B * V * stride)), 0.0, 0.0);
+            if (dbc_vd.download<std::uint16_t>(B * V * Hc) != hbc_v) {
+                throw std::runtime_error("tp2_packet_ar_sconv_verify block_copy mismatch");
+            }
+        }
+
+        // Wave 4 fused TP2 Packet AllReduce + in-place residual_add (2 consecutive epochs)
+        for (int ep = 0; ep < 2; ++ep) {
+            auto hp  = rand_bf16(rng, 4 * Hc, 0.5f);
+            auto hri = rand_bf16(rng, 4 * Hc, 0.5f);
+            DevBuf dp(hp.size() * 2), dri(hri.size() * 2);
+            dp.upload(hp); dri.upload(hri);
+            Tensor tp  = make_t(dp.ptr, DType::BF16, Hc, 4);
+            Tensor tri = make_t(dri.ptr, DType::BF16, Hc, 4);
+            ops::inkling2_tp2_packet_allreduce_residual(tp, mbox.ptr, mbox.ptr, epoch_bytes, tri, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<double> ref(4 * Hc);
+            for (int i = 0; i < 4 * Hc; ++i) {
+                float p    = bf16_to_f32(hp[i]);
+                float ar   = bf16_to_f32(f32_to_bf16(p + p));
+                ref[i]     = bf16_to_f32(f32_to_bf16(bf16_to_f32(hri[i]) + ar));
+            }
+            check_close(ep == 0 ? "tp2_packet_ar_residual ep0 exact"
+                                : "tp2_packet_ar_residual ep1 exact",
+                        ref, to_f64_from_bf16(dri.download<std::uint16_t>(4 * Hc)), 0.0, 0.0);
+        }
+    }
 }
 
 // ============================================================================
@@ -784,7 +1117,7 @@ void test_attention(cudaStream_t stream) {
         DevBuf dqs(hqs.size() * 2), drs(hrs.size() * 2), drp(hrp.size() * 2);
         DevBuf dqout(S_tot * n_q * D * 2), drbout(S_tot * n_q * rel_ext * 4);
         DevBuf dout_pre(S_tot * n_q * D * 2), dout_ver(S_dec * n_q * D * 2);
-        DevBuf dsplit(S_dec * n_q * 16 * (D + 2) * 4);
+        DevBuf dsplit(S_dec * n_q * 16 * (D + 4) * 4);
         dqgrs.upload(hqgrs);
         dk.upload(hk);
         dv.upload(hv);
@@ -919,6 +1252,262 @@ void test_attention(cudaStream_t stream) {
         check_close(is_local ? "attn SWA decode_verify vs FP64 oracle"
                              : "attn Full decode_verify vs FP64 oracle",
                     ref_last, got_last, 2e-2, 2e-2);
+
+        // Also test Wave 4 single-launch adaptive split_done at short context (eff_splits == 1)
+        DevBuf dsdone(S_dec * n_q * 4);
+        dsdone.zero();
+        DevBuf dout_ad(S_dec * n_q * D * 2);
+        Tensor to_ad = make_t(dout_ad.ptr, DType::BF16, n_q * D, S_dec);
+        ops::inkling2_attn_decode_verify(
+            tq_sub, tqgrs_sub, trb_sub, kv, static_cast<const std::int32_t*>(dlanes.ptr),
+            static_cast<const std::int32_t*>(dpos.ptr) + S_pre, 1, S_dec, n_q, n_kv, swa_win,
+            static_cast<float*>(dsplit.ptr), 16, to_ad, stream,
+            static_cast<std::int32_t*>(dsdone.ptr));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        check_close(is_local ? "attn SWA adaptive (eff_splits=1) vs FP64"
+                             : "attn Full adaptive (eff_splits=1) vs FP64",
+                    ref_last,
+                    [&]() {
+                        auto v = to_f64_from_bf16(dout_ad.download<std::uint16_t>(S_dec * n_q * D));
+                        return std::vector<double>(v.begin() + (S_dec - 1) * n_q * D, v.end());
+                    }(),
+                    2e-2, 2e-2);
+    }
+
+    // Fused K/V SConv inside attn_prologue (static & dynamic x decode & verify) vs separate sconv + prologue
+    for (bool is_dyn : {false, true}) {
+        for (bool is_ver : {false, true}) {
+            const int B = 2, Q = is_ver ? 4 : 1, T = B * Q, C = n_kv * D;
+            const std::size_t stride = 6 * C;
+            auto hqgrs_s = rand_bf16(rng, T * packed, 0.5f);
+            auto hk_s    = rand_bf16(rng, T * C, 0.5f);
+            auto hv_s    = rand_bf16(rng, T * C, 0.5f);
+            auto hwk     = rand_bf16(rng, C * 4, 0.4f);
+            auto hwv     = rand_bf16(rng, C * 4, 0.4f);
+            auto hdk     = rand_bf16(rng, T * n_kv * 4, 0.3f);
+            auto hdv     = rand_bf16(rng, T * n_kv * 4, 0.3f);
+            auto hst0    = rand_f32(rng, B * stride, 0.4f);
+            std::vector<std::int32_t> hlanes_b = {0, 1}, hlanes_t(T), hpos_t(T);
+            for (int b = 0; b < B; ++b) {
+                for (int q = 0; q < Q; ++q) {
+                    hlanes_t[b * Q + q] = b;
+                    hpos_t[b * Q + q]   = 10 + q;
+                }
+            }
+            const int ring_cap = 32;
+            DevBuf dqgrs(hqgrs_s.size() * 2), dk(hk_s.size() * 2), dv(hv_s.size() * 2);
+            DevBuf dqs(hqs.size() * 2), drs(hrs.size() * 2), drp(hrp.size() * 2);
+            DevBuf dwk(hwk.size() * 2), dwv(hwv.size() * 2), ddk(hdk.size() * 2), ddv(hdv.size() * 2);
+            DevBuf dst_ref(B * stride * 4), dst_fus(B * stride * 4);
+            DevBuf dv_ref(B * Q * stride * 4), dv_fus(B * Q * stride * 4);
+            DevBuf dlb(B * 4), dlt(T * 4), dpt(T * 4);
+            DevBuf dk_sc(hk_s.size() * 2), dv_sc(hv_s.size() * 2);
+            DevBuf dqo_r(T * n_q * D * 2), drb_r(T * n_q * rel_ext * 4);
+            DevBuf dqo_f(T * n_q * D * 2), drb_f(T * n_q * rel_ext * 4);
+            DevBuf drk_r(B * ring_cap * C * 2), drv_r(B * ring_cap * C * 2);
+            DevBuf drk_f(B * ring_cap * C * 2), drv_f(B * ring_cap * C * 2);
+            dqgrs.upload(hqgrs_s); dk.upload(hk_s); dv.upload(hv_s);
+            dqs.upload(hqs); drs.upload(hrs); drp.upload(hrp);
+            dwk.upload(hwk); dwv.upload(hwv); ddk.upload(hdk); ddv.upload(hdv);
+            dst_ref.upload(hst0); dst_fus.upload(hst0);
+            dv_ref.zero(); dv_fus.zero(); drk_r.zero(); drv_r.zero(); drk_f.zero(); drv_f.zero();
+            dlb.upload(hlanes_b); dlt.upload(hlanes_t); dpt.upload(hpos_t);
+
+            Tensor tqgrs = make_t(dqgrs.ptr, DType::BF16, packed, T);
+            Tensor tk    = make_t(dk.ptr, DType::BF16, C, T), tv = make_t(dv.ptr, DType::BF16, C, T);
+            Tensor tqs   = make_t(dqs.ptr, DType::BF16, D, n_q), trs = make_t(drs.ptr, DType::BF16, d_rel, n_q);
+            Tensor trp   = make_t(drp.ptr, DType::BF16, rel_ext, d_rel);
+            Tensor twk   = make_t(dwk.ptr, DType::BF16, 4, C), twv = make_t(dwv.ptr, DType::BF16, 4, C);
+            Tensor tdk   = make_t(ddk.ptr, DType::BF16, 4 * n_kv, T), tdv = make_t(ddv.ptr, DType::BF16, 4 * n_kv, T);
+            Tensor tksc  = make_t(dk_sc.ptr, DType::BF16, C, T), tvsc = make_t(dv_sc.ptr, DType::BF16, C, T);
+            Tensor tqo_r = make_t(dqo_r.ptr, DType::BF16, D, n_q, T), trb_r = make_t(drb_r.ptr, DType::FP32, rel_ext, n_q, T);
+            Tensor tqo_f = make_t(dqo_f.ptr, DType::BF16, D, n_q, T), trb_f = make_t(drb_f.ptr, DType::FP32, rel_ext, n_q, T);
+
+            ops::Inkling2KvTarget kv_r{}, kv_f{};
+            kv_r.is_local = true; kv_r.ring_k = drk_r.ptr; kv_r.ring_v = drv_r.ptr; kv_r.ring_cap = ring_cap;
+            kv_f.is_local = true; kv_f.ring_k = drk_f.ptr; kv_f.ring_v = drv_f.ptr; kv_f.ring_cap = ring_cap;
+
+            // Unfused reference
+            if (!is_dyn && !is_ver) {
+                ops::inkling2_sconv_kv_static_decode(tk, twk, static_cast<float*>(dst_ref.ptr),
+                                                     tv, twv, static_cast<float*>(dst_ref.ptr) + 3 * C,
+                                                     static_cast<const std::int32_t*>(dlb.ptr), B,
+                                                     tksc, tvsc, stream, stride);
+            } else if (!is_dyn && is_ver) {
+                ops::inkling2_sconv_kv_static_verify(tk, twk, static_cast<const float*>(dst_ref.ptr),
+                                                     static_cast<float*>(dv_ref.ptr),
+                                                     tv, twv, static_cast<const float*>(dst_ref.ptr) + 3 * C,
+                                                     static_cast<float*>(dv_ref.ptr) + 3 * C,
+                                                     static_cast<const std::int32_t*>(dlb.ptr), B, Q,
+                                                     tksc, tvsc, stream, stride, Q);
+            } else if (is_dyn && !is_ver) {
+                ops::inkling2_sconv_kv_dynamic_decode(tk, tdk, twk, static_cast<float*>(dst_ref.ptr),
+                                                      tv, tdv, twv, static_cast<float*>(dst_ref.ptr) + 3 * C,
+                                                      n_kv, static_cast<const std::int32_t*>(dlb.ptr), B,
+                                                      tksc, tvsc, stream, stride);
+            } else {
+                ops::inkling2_sconv_kv_dynamic_verify(tk, tdk, twk, static_cast<const float*>(dst_ref.ptr),
+                                                      static_cast<float*>(dv_ref.ptr),
+                                                      tv, tdv, twv, static_cast<const float*>(dst_ref.ptr) + 3 * C,
+                                                      static_cast<float*>(dv_ref.ptr) + 3 * C,
+                                                      n_kv, static_cast<const std::int32_t*>(dlb.ptr), B, Q,
+                                                      tksc, tvsc, stream, stride, Q);
+            }
+            ops::inkling2_attn_prologue(tqgrs, tksc, tvsc, tqs, trs, trp,
+                                        static_cast<const std::int32_t*>(dpt.ptr),
+                                        static_cast<const std::int32_t*>(dlt.ptr), T, n_q, n_kv,
+                                        kv_r, !is_dyn, 8.0f, 8.0f, 8.0f, 0.25f, 1e-6f, tqo_r, trb_r,
+                                        stream);
+
+            // Fused prologue
+            ops::Inkling2AttnSconvArgs sc{};
+            sc.is_dynamic     = is_dyn;
+            sc.k_weight       = dwk.ptr;
+            sc.v_weight       = dwv.ptr;
+            sc.k_dyn          = is_dyn ? ddk.ptr : nullptr;
+            sc.v_dyn          = is_dyn ? ddv.ptr : nullptr;
+            sc.k_state_pool   = static_cast<float*>(dst_fus.ptr);
+            sc.v_state_pool   = static_cast<float*>(dst_fus.ptr) + 3 * C;
+            sc.k_verify_pool  = is_ver ? static_cast<float*>(dv_fus.ptr) : nullptr;
+            sc.v_verify_pool  = is_ver ? (static_cast<float*>(dv_fus.ptr) + 3 * C) : nullptr;
+            sc.lane_stride    = stride;
+            sc.q_per_lane     = Q;
+            sc.max_verify_len = Q;
+            ops::inkling2_attn_prologue(tqgrs, tk, tv, tqs, trs, trp,
+                                        static_cast<const std::int32_t*>(dpt.ptr),
+                                        static_cast<const std::int32_t*>(dlt.ptr), T, n_q, n_kv,
+                                        kv_f, !is_dyn, 8.0f, 8.0f, 8.0f, 0.25f, 1e-6f, tqo_f, trb_f,
+                                        stream, &sc);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "attn_prologue+sconv %s %s KV", is_dyn ? "dyn" : "stat",
+                          is_ver ? "ver" : "dec");
+            check_close(lbl, to_f64_from_bf16(drk_r.download<std::uint16_t>(B * ring_cap * C)),
+                        to_f64_from_bf16(drk_f.download<std::uint16_t>(B * ring_cap * C)), 1e-2, 1e-2);
+            check_close(lbl, to_f64_from_bf16(drv_r.download<std::uint16_t>(B * ring_cap * C)),
+                        to_f64_from_bf16(drv_f.download<std::uint16_t>(B * ring_cap * C)), 1e-2, 1e-2);
+            check_close("attn_prologue+sconv state",
+                        to_f64_from_f32(dst_ref.download<float>(B * stride)),
+                        to_f64_from_f32(dst_fus.download<float>(B * stride)), 1e-5, 1e-5);
+            if (is_ver) {
+                check_close("attn_prologue+sconv verify_state",
+                            to_f64_from_f32(dv_ref.download<float>(B * Q * stride)),
+                            to_f64_from_f32(dv_fus.download<float>(B * Q * stride)), 1e-5, 1e-5);
+            }
+        }
+    }
+
+    // Wave 4 Long-Context Adaptive Last-CTA Split-KV (total_k = 1200 -> eff_splits > 1)
+    // Exercises BOTH cyclic SWA ring wrap (ring_cap=1024) AND paged global (20 permuted pages)!
+    for (bool is_local : {true, false}) {
+        const int total_k = 1200, q_per = 4, swa_win = 1024;
+        const int ring_cap = 1024, max_pages = 20;
+        auto hq_l    = rand_bf16(rng, q_per * n_q * D, 0.4f);
+        auto hqgrs_l = rand_bf16(rng, q_per * packed, 0.4f);
+        auto hrb_l   = rand_f32(rng, q_per * n_q * rel_ext, 0.1f);
+        auto hk_all  = rand_bf16(rng, total_k * n_kv * D, 0.35f);
+        auto hv_all  = rand_bf16(rng, total_k * n_kv * D, 0.35f);
+
+        std::vector<std::int32_t> hbt(max_pages);
+        for (int p = 0; p < max_pages; ++p) { hbt[p] = (p * 7 + 3) % max_pages; }
+        std::vector<std::uint16_t> hring_k(ring_cap * n_kv * D, 0), hring_v(ring_cap * n_kv * D, 0);
+        std::vector<std::uint16_t> hpage_k(max_pages * n_kv * 64 * D, 0), hpage_v(max_pages * n_kv * 64 * D, 0);
+        for (int kp = 0; kp < total_k; ++kp) {
+            const int slot = kp % ring_cap;
+            const int pp   = hbt[kp >> 6];
+            const int ps   = kp & 63;
+            for (int h = 0; h < n_kv; ++h) {
+                for (int d = 0; d < D; ++d) {
+                    const std::uint16_t kv_b = hk_all[(kp * n_kv + h) * D + d];
+                    const std::uint16_t vv_b = hv_all[(kp * n_kv + h) * D + d];
+                    hring_k[(slot * n_kv + h) * D + d]           = kv_b;
+                    hring_v[(slot * n_kv + h) * D + d]           = vv_b;
+                    hpage_k[((pp * n_kv + h) * 64 + ps) * D + d] = kv_b;
+                    hpage_v[((pp * n_kv + h) * 64 + ps) * D + d] = vv_b;
+                }
+            }
+        }
+        std::vector<std::int32_t> hlane = {0}, hpos(q_per);
+        for (int i = 0; i < q_per; ++i) { hpos[i] = total_k - q_per + i; }
+
+        DevBuf dq_l(hq_l.size() * 2), dqgrs_l(hqgrs_l.size() * 2), drb_l(hrb_l.size() * 4);
+        DevBuf dring_k(hring_k.size() * 2), dring_v(hring_v.size() * 2);
+        DevBuf dpage_k(hpage_k.size() * 2), dpage_v(hpage_v.size() * 2);
+        DevBuf dbt(max_pages * 4), dl(4), dp(q_per * 4);
+        DevBuf dsplit(q_per * n_q * 16 * (D + 4) * 4), dsdone(q_per * n_q * 4), dout(q_per * n_q * D * 2);
+        dq_l.upload(hq_l); dqgrs_l.upload(hqgrs_l); drb_l.upload(hrb_l);
+        dring_k.upload(hring_k); dring_v.upload(hring_v);
+        dpage_k.upload(hpage_k); dpage_v.upload(hpage_v);
+        dbt.upload(hbt); dl.upload(hlane); dp.upload(hpos);
+        dsdone.zero();
+
+        ops::Inkling2KvTarget kv{};
+        kv.is_local          = is_local;
+        kv.ring_k            = dring_k.ptr;
+        kv.ring_v            = dring_v.ptr;
+        kv.ring_cap          = ring_cap;
+        kv.paged_k           = dpage_k.ptr;
+        kv.paged_v           = dpage_v.ptr;
+        kv.block_tables      = static_cast<const std::int32_t*>(dbt.ptr);
+        kv.max_logical_pages = max_pages;
+
+        Tensor tq_l    = make_t(dq_l.ptr, DType::BF16, D, n_q, q_per);
+        Tensor tqgrs_l = make_t(dqgrs_l.ptr, DType::BF16, packed, q_per);
+        Tensor trb_l   = make_t(drb_l.ptr, DType::FP32, rel_ext, n_q, q_per);
+        Tensor to_l    = make_t(dout.ptr, DType::BF16, n_q * D, q_per);
+        ops::inkling2_attn_decode_verify(tq_l, tqgrs_l, trb_l, kv,
+                                         static_cast<const std::int32_t*>(dl.ptr),
+                                         static_cast<const std::int32_t*>(dp.ptr), 1, q_per, n_q,
+                                         n_kv, swa_win, static_cast<float*>(dsplit.ptr), 16, to_l,
+                                         stream, static_cast<std::int32_t*>(dsdone.ptr));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        auto done_after = dsdone.download<std::int32_t>(q_per * n_q);
+        for (int v : done_after) {
+            if (v != 0) { throw std::runtime_error("attn adaptive split_done not reset to 0"); }
+        }
+        // Independent FP64 oracle on last query (pos = total_k - 1)
+        const int qi = q_per - 1, qpos = hpos[qi];
+        const int k_start = is_local ? std::max(0, qpos - swa_win + 1) : 0;
+        std::vector<double> ref(n_q * D);
+        for (int qh = 0; qh < n_q; ++qh) {
+            const int kvh     = qh / 3;
+            const double sink = bf16_to_f32(hqgrs_l[qi * packed + 2 * n_q * D + n_q * d_rel + qh]);
+            std::vector<double> scs;
+            scs.reserve(qpos - k_start + 1);
+            double mx = sink;
+            for (int kp = k_start; kp <= qpos; ++kp) {
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) {
+                    dot += bf16_to_f32(hq_l[(qi * n_q + qh) * D + d]) *
+                           bf16_to_f32(hk_all[(kp * n_kv + kvh) * D + d]);
+                }
+                dot /= std::sqrt(static_cast<double>(D));
+                const int dist = qpos - kp;
+                if (dist < rel_ext) { dot += hrb_l[(qi * n_q + qh) * rel_ext + dist]; }
+                scs.push_back(dot);
+                mx = std::max(mx, dot);
+            }
+            double den = std::exp(sink - mx);
+            std::vector<double> acc(D, 0.0);
+            for (std::size_t idx = 0; idx < scs.size(); ++idx) {
+                const int kp = k_start + static_cast<int>(idx);
+                double p     = std::exp(scs[idx] - mx);
+                den += p;
+                for (int d = 0; d < D; ++d) {
+                    acc[d] += p * bf16_to_f32(hv_all[(kp * n_kv + kvh) * D + d]);
+                }
+            }
+            for (int d = 0; d < D; ++d) {
+                double g = bf16_to_f32(hqgrs_l[qi * packed + n_q * D + qh * D + d]);
+                ref[qh * D + d] = (acc[d] / den) / (1.0 + std::exp(-g));
+            }
+        }
+        auto got_all = to_f64_from_bf16(dout.download<std::uint16_t>(q_per * n_q * D));
+        std::vector<double> got_last(got_all.begin() + qi * n_q * D, got_all.end());
+        check_close(is_local ? "attn SWA long-ctx adaptive Split-KV (1200) vs FP64"
+                             : "attn Full long-ctx adaptive Split-KV (1200) vs FP64",
+                    ref, got_last, 2e-2, 2e-2);
     }
 }
 
@@ -1149,6 +1738,42 @@ void test_sparse_moe(cudaStream_t stream) {
             check_close(lbl1, ref0, std::vector<double>(gtp1.begin(), gtp1.begin() + H), 0.15, 0.04);
             check_close(lbl2, gtp1, gtp2, 0.08, 0.02);
         }
+
+        // Wave 3/4.5: router_fused(prep_mode=1) + skip_prep=true across T=4, 8 (forces mc=1,2,3,4!)
+        for (int T : {4, 8}) {
+            auto hx  = rand_bf16(rng, T * H, 0.3f);
+            auto hrw = rand_bf16(rng, E * H, 0.05f);
+            // Bias experts 0..11 strongly so multiple tokens collide on the same experts (mc=3, 4)!
+            std::vector<float> hrb(E, -20.0f);
+            for (int e = 0; e < 12; ++e) { hrb[e] = 2.0f + 0.05f * e; }
+            DevBuf dx(hx.size() * 2), drw(hrw.size() * 2), dout_ref(T * H * 2), dout_fus(T * H * 2);
+            dx.upload(hx); drw.upload(hrw); d_rbias.upload(hrb);
+            Tensor tx = make_t(dx.ptr, DType::BF16, H, T), trw = make_t(drw.ptr, DType::BF16, H, E);
+            Tensor trb = make_t(d_rbias.ptr, DType::FP32, E), trl = make_t(d_rlog.ptr, DType::FP32, E, T);
+            Tensor tor = make_t(dout_ref.ptr, DType::BF16, H, T), tof = make_t(dout_fus.ptr, DType::BF16, H, T);
+
+            ops::inkling2_bf16_linear(tx, trw, trl, stream);
+            ops::inkling2_moe_route(trl, trb, 8.0f, sc, T, stream);
+            ops::inkling2_moe_nvfp4_forward(tx, dw13c.ptr, dw13s.ptr,
+                                            static_cast<const float*>(dw13a.ptr),
+                                            static_cast<const float*>(dw13d.ptr), dw2c.ptr,
+                                            dw2s.ptr, static_cast<const float*>(dw2a.ptr),
+                                            static_cast<const float*>(dw2d.ptr), 1, 4.0f, 25.0f,
+                                            sc, tor, stream, false, false);
+
+            ops::inkling2_moe_router_fused(tx, trw, trb, 8.0f, sc, stream, 1);
+            ops::inkling2_moe_nvfp4_forward(tx, dw13c.ptr, dw13s.ptr,
+                                            static_cast<const float*>(dw13a.ptr),
+                                            static_cast<const float*>(dw13d.ptr), dw2c.ptr,
+                                            dw2s.ptr, static_cast<const float*>(dw2a.ptr),
+                                            static_cast<const float*>(dw2d.ptr), 1, 4.0f, 25.0f,
+                                            sc, tof, stream, true, false);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "moe_nvfp4 router_fused(prep=1)+TileM4 T=%d", T);
+            check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
+                        to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+        }
     }
 
     // --- MXFP8 MoE (T=1 and T=6, check TP1 vs FP64 AND TP1 == TP2_s0 + TP2_s1) ---
@@ -1263,6 +1888,33 @@ void test_sparse_moe(cudaStream_t stream) {
             std::snprintf(lbl2, sizeof(lbl2), "moe_mxfp8 T=%d TP1 == TP2_s0 + TP2_s1", T);
             check_close(lbl1, ref0, std::vector<double>(gtp1.begin(), gtp1.begin() + H), 0.10, 0.03);
             check_close(lbl2, gtp1, gtp2, 0.05, 0.02);
+        }
+
+        // Wave 3/4.5: router_fused(prep_mode=2) + skip_prep=true across T=4, 8 (SMEM w13 + 128r w2, mc=1..4!)
+        for (int T : {4, 8}) {
+            auto hx  = rand_bf16(rng, T * H, 0.3f);
+            auto hrw = rand_bf16(rng, E * H, 0.05f);
+            std::vector<float> hrb(E, -20.0f);
+            for (int e = 0; e < 10; ++e) { hrb[e] = 2.0f + 0.05f * e; }
+            DevBuf dx(hx.size() * 2), drw(hrw.size() * 2), dout_ref(T * H * 2), dout_fus(T * H * 2);
+            dx.upload(hx); drw.upload(hrw); d_rbias.upload(hrb);
+            Tensor tx = make_t(dx.ptr, DType::BF16, H, T), trw = make_t(drw.ptr, DType::BF16, H, E);
+            Tensor trb = make_t(d_rbias.ptr, DType::FP32, E), trl = make_t(d_rlog.ptr, DType::FP32, E, T);
+            Tensor tor = make_t(dout_ref.ptr, DType::BF16, H, T), tof = make_t(dout_fus.ptr, DType::BF16, H, T);
+
+            ops::inkling2_bf16_linear(tx, trw, trl, stream);
+            ops::inkling2_moe_route(trl, trb, 8.0f, sc, T, stream);
+            ops::inkling2_moe_mxfp8_forward(tx, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr, 1, 4.0f,
+                                            25.0f, sc, tor, stream, false, false);
+
+            ops::inkling2_moe_router_fused(tx, trw, trb, 8.0f, sc, stream, 2);
+            ops::inkling2_moe_mxfp8_forward(tx, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr, 1, 4.0f,
+                                            25.0f, sc, tof, stream, true, false);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "moe_mxfp8 router_fused(prep=2)+128r T=%d", T);
+            check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
+                        to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
         }
     }
 }
@@ -1539,6 +2191,247 @@ void test_dspark_ops(cudaStream_t stream) {
         }
         check_close("mtp_mix_rmsnorm_indexed (H=2304)", ref,
                     to_f64_from_bf16(dout.download<std::uint16_t>(count * H2)), 2e-2, 1.5e-2);
+    }
+
+    // Wave 4: mtp_mix_rmsnorm_batch3_and_frnn vs 4 separate mtp_mix_rmsnorm_indexed calls
+    {
+        const int cap_T = 10, ctx_cnt = 5, frnn_cnt = 2;
+        auto hcaps = rand_bf16(rng, cap_T * 4 * H, 0.6f);
+        auto hfw   = rand_bf16(rng, 16, 0.5f);
+        auto hn0   = rand_bf16(rng, H, 1.0f), hn1 = rand_bf16(rng, H, 1.0f),
+             hn2   = rand_bf16(rng, H, 1.0f), hnf = rand_bf16(rng, H, 1.0f);
+        std::vector<std::int32_t> hcsrc = {8, 1, 5, 3, 9}, hfsrc = {4, 2}, hfdst = {1, 0};
+        DevBuf dcaps(hcaps.size() * 2), dfw(32), dn0(H * 2), dn1(H * 2), dn2(H * 2), dnf(H * 2);
+        DevBuf dcsrc(ctx_cnt * 4), dfsrc(frnn_cnt * 4), dfdst(frnn_cnt * 4);
+        DevBuf dor0(ctx_cnt * H * 2), dor1(ctx_cnt * H * 2), dor2(ctx_cnt * H * 2), dorf(frnn_cnt * H * 2);
+        DevBuf dof0(ctx_cnt * H * 2), dof1(ctx_cnt * H * 2), dof2(ctx_cnt * H * 2), doff(frnn_cnt * H * 2);
+        dcaps.upload(hcaps); dfw.upload(hfw);
+        dn0.upload(hn0); dn1.upload(hn1); dn2.upload(hn2); dnf.upload(hnf);
+        dcsrc.upload(hcsrc); dfsrc.upload(hfsrc); dfdst.upload(hfdst);
+        Tensor tcaps = make_t(dcaps.ptr, DType::BF16, H, 4, cap_T), tfw = make_t(dfw.ptr, DType::BF16, 4, 4);
+        Tensor tn0 = make_t(dn0.ptr, DType::BF16, H), tn1 = make_t(dn1.ptr, DType::BF16, H),
+               tn2 = make_t(dn2.ptr, DType::BF16, H), tnf = make_t(dnf.ptr, DType::BF16, H);
+        Tensor tor0 = make_t(dor0.ptr, DType::BF16, H, ctx_cnt), tor1 = make_t(dor1.ptr, DType::BF16, H, ctx_cnt),
+               tor2 = make_t(dor2.ptr, DType::BF16, H, ctx_cnt), torf = make_t(dorf.ptr, DType::BF16, H, frnn_cnt);
+        Tensor tof0 = make_t(dof0.ptr, DType::BF16, H, ctx_cnt), tof1 = make_t(dof1.ptr, DType::BF16, H, ctx_cnt),
+               tof2 = make_t(dof2.ptr, DType::BF16, H, ctx_cnt), toff = make_t(doff.ptr, DType::BF16, H, frnn_cnt);
+        const auto* cs = static_cast<const std::int32_t*>(dcsrc.ptr);
+        const auto* fs = static_cast<const std::int32_t*>(dfsrc.ptr);
+        const auto* fd = static_cast<const std::int32_t*>(dfdst.ptr);
+
+        ops::inkling2_mtp_mix_rmsnorm_indexed(tcaps, cs, nullptr, ctx_cnt, tfw, 0, tn0, eps, tor0, stream);
+        ops::inkling2_mtp_mix_rmsnorm_indexed(tcaps, cs, nullptr, ctx_cnt, tfw, 1, tn1, eps, tor1, stream);
+        ops::inkling2_mtp_mix_rmsnorm_indexed(tcaps, cs, nullptr, ctx_cnt, tfw, 2, tn2, eps, tor2, stream);
+        ops::inkling2_mtp_mix_rmsnorm_indexed(tcaps, fs, fd, frnn_cnt, tfw, 3, tnf, eps, torf, stream);
+        ops::inkling2_mtp_mix_rmsnorm_batch3_and_frnn(tcaps, cs, ctx_cnt, fs, fd, frnn_cnt, tfw,
+                                                      tn0, tn1, tn2, tnf, eps, tof0, tof1, tof2,
+                                                      toff, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        check_close("mtp_mix_batch3_and_frnn out0 exact", to_f64_from_bf16(dor0.download<std::uint16_t>(ctx_cnt * H)), to_f64_from_bf16(dof0.download<std::uint16_t>(ctx_cnt * H)), 0.0, 0.0);
+        check_close("mtp_mix_batch3_and_frnn out1 exact", to_f64_from_bf16(dor1.download<std::uint16_t>(ctx_cnt * H)), to_f64_from_bf16(dof1.download<std::uint16_t>(ctx_cnt * H)), 0.0, 0.0);
+        check_close("mtp_mix_batch3_and_frnn out2 exact", to_f64_from_bf16(dor2.download<std::uint16_t>(ctx_cnt * H)), to_f64_from_bf16(dof2.download<std::uint16_t>(ctx_cnt * H)), 0.0, 0.0);
+        check_close("mtp_mix_batch3_and_frnn frnn exact", to_f64_from_bf16(dorf.download<std::uint16_t>(frnn_cnt * H)), to_f64_from_bf16(doff.download<std::uint16_t>(frnn_cnt * H)), 0.0, 0.0);
+    }
+
+    // Wave 4: mtp_ctx_kv_write_3 (ring + paged + ring) vs 3 separate calls
+    {
+        const int tok = 5, ring_cap = 32, max_pages = 4;
+        auto hkv0 = rand_bf16(rng, tok * 2 * n_kv * D, 0.5f),
+             hkv1 = rand_bf16(rng, tok * 2 * n_kv * D, 0.5f),
+             hkv2 = rand_bf16(rng, tok * 2 * n_kv * D, 0.5f);
+        auto hkn0 = rand_bf16(rng, D, 1.0f), hkn1 = rand_bf16(rng, D, 1.0f), hkn2 = rand_bf16(rng, D, 1.0f);
+        std::vector<std::int32_t> hpos = {2, 3, 4, 64, 65}, hlanes = {0, 0, 0, 0, 0}, hbt = {3, 1, 0, 2};
+        DevBuf dkv0(hkv0.size() * 2), dkv1(hkv1.size() * 2), dkv2(hkv2.size() * 2);
+        DevBuf dkn0(D * 2), dkn1(D * 2), dkn2(D * 2), dpos(tok * 4), dl(tok * 4), dbt(max_pages * 4);
+        dkv0.upload(hkv0); dkv1.upload(hkv1); dkv2.upload(hkv2);
+        dkn0.upload(hkn0); dkn1.upload(hkn1); dkn2.upload(hkn2);
+        dpos.upload(hpos); dl.upload(hlanes); dbt.upload(hbt);
+        DevBuf rk0r(ring_cap * n_kv * D * 2), rv0r(ring_cap * n_kv * D * 2),
+               pk1r(max_pages * n_kv * 64 * D * 2), pv1r(max_pages * n_kv * 64 * D * 2),
+               rk2r(ring_cap * n_kv * D * 2), rv2r(ring_cap * n_kv * D * 2);
+        DevBuf rk0f(ring_cap * n_kv * D * 2), rv0f(ring_cap * n_kv * D * 2),
+               pk1f(max_pages * n_kv * 64 * D * 2), pv1f(max_pages * n_kv * 64 * D * 2),
+               rk2f(ring_cap * n_kv * D * 2), rv2f(ring_cap * n_kv * D * 2);
+        rk0r.zero(); rv0r.zero(); pk1r.zero(); pv1r.zero(); rk2r.zero(); rv2r.zero();
+        rk0f.zero(); rv0f.zero(); pk1f.zero(); pv1f.zero(); rk2f.zero(); rv2f.zero();
+
+        ops::Inkling2KvTarget kv0r{}, kv1r{}, kv2r{}, kv0f{}, kv1f{}, kv2f{};
+        kv0r.is_local = true;  kv0r.ring_k = rk0r.ptr; kv0r.ring_v = rv0r.ptr; kv0r.ring_cap = ring_cap;
+        kv1r.is_local = false; kv1r.paged_k = pk1r.ptr; kv1r.paged_v = pv1r.ptr; kv1r.block_tables = static_cast<const std::int32_t*>(dbt.ptr); kv1r.max_logical_pages = max_pages;
+        kv2r.is_local = true;  kv2r.ring_k = rk2r.ptr; kv2r.ring_v = rv2r.ptr; kv2r.ring_cap = ring_cap;
+        kv0f.is_local = true;  kv0f.ring_k = rk0f.ptr; kv0f.ring_v = rv0f.ptr; kv0f.ring_cap = ring_cap;
+        kv1f.is_local = false; kv1f.paged_k = pk1f.ptr; kv1f.paged_v = pv1f.ptr; kv1f.block_tables = static_cast<const std::int32_t*>(dbt.ptr); kv1f.max_logical_pages = max_pages;
+        kv2f.is_local = true;  kv2f.ring_k = rk2f.ptr; kv2f.ring_v = rv2f.ptr; kv2f.ring_cap = ring_cap;
+
+        Tensor tk0 = make_t(dkv0.ptr, DType::BF16, 2 * n_kv * D, tok),
+               tk1 = make_t(dkv1.ptr, DType::BF16, 2 * n_kv * D, tok),
+               tk2 = make_t(dkv2.ptr, DType::BF16, 2 * n_kv * D, tok);
+        Tensor tn0 = make_t(dkn0.ptr, DType::BF16, D), tn1 = make_t(dkn1.ptr, DType::BF16, D),
+               tn2 = make_t(dkn2.ptr, DType::BF16, D);
+        const auto* pp = static_cast<const std::int32_t*>(dpos.ptr);
+        const auto* lp = static_cast<const std::int32_t*>(dl.ptr);
+        ops::inkling2_mtp_ctx_kv_write(tk0, tn0, pp, lp, tok, n_kv, 1e6f, eps, kv0r, stream);
+        ops::inkling2_mtp_ctx_kv_write(tk1, tn1, pp, lp, tok, n_kv, 1e6f, eps, kv1r, stream);
+        ops::inkling2_mtp_ctx_kv_write(tk2, tn2, pp, lp, tok, n_kv, 1e6f, eps, kv2r, stream);
+        ops::inkling2_mtp_ctx_kv_write_3(tk0, tn0, kv0f, tk1, tn1, kv1f, tk2, tn2, kv2f,
+                                         pp, lp, tok, n_kv, 1e6f, eps, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        check_close("mtp_ctx_kv_write_3 L0 K exact", to_f64_from_bf16(rk0r.download<std::uint16_t>(ring_cap * n_kv * D)), to_f64_from_bf16(rk0f.download<std::uint16_t>(ring_cap * n_kv * D)), 0.0, 0.0);
+        check_close("mtp_ctx_kv_write_3 L1 K exact", to_f64_from_bf16(pk1r.download<std::uint16_t>(max_pages * n_kv * 64 * D)), to_f64_from_bf16(pk1f.download<std::uint16_t>(max_pages * n_kv * 64 * D)), 0.0, 0.0);
+        check_close("mtp_ctx_kv_write_3 L2 V exact", to_f64_from_bf16(rv2r.download<std::uint16_t>(ring_cap * n_kv * D)), to_f64_from_bf16(rv2f.download<std::uint16_t>(ring_cap * n_kv * D)), 0.0, 0.0);
+    }
+
+    // Wave 4: mtp_block_attention long-context adaptive Last-CTA Split-KV (ctx_len=1100, SWA & Paged Global)
+    for (bool is_local : {true, false}) {
+        const int ctx_len = 1100, blk_sz = 4, swa_win = 1024, ring_cap = 1024, max_pages = 20;
+        auto hq  = rand_bf16(rng, blk_sz * n_q * D, 0.4f);
+        auto hkb = rand_bf16(rng, blk_sz * n_kv * D, 0.4f);
+        auto hvb = rand_bf16(rng, blk_sz * n_kv * D, 0.4f);
+        auto hkc = rand_bf16(rng, ctx_len * n_kv * D, 0.35f);
+        auto hvc = rand_bf16(rng, ctx_len * n_kv * D, 0.35f);
+        std::vector<std::int32_t> hbt(max_pages);
+        for (int p = 0; p < max_pages; ++p) { hbt[p] = (p * 11 + 5) % max_pages; }
+        std::vector<std::uint16_t> hrk(ring_cap * n_kv * D, 0), hrv(ring_cap * n_kv * D, 0);
+        std::vector<std::uint16_t> hpk(max_pages * n_kv * 64 * D, 0), hpv(max_pages * n_kv * 64 * D, 0);
+        for (int kp = 0; kp < ctx_len; ++kp) {
+            const int slot = kp % ring_cap, pp = hbt[kp >> 6], ps = kp & 63;
+            for (int h = 0; h < n_kv; ++h) {
+                for (int d = 0; d < D; ++d) {
+                    hrk[(slot * n_kv + h) * D + d]           = hkc[(kp * n_kv + h) * D + d];
+                    hrv[(slot * n_kv + h) * D + d]           = hvc[(kp * n_kv + h) * D + d];
+                    hpk[((pp * n_kv + h) * 64 + ps) * D + d] = hkc[(kp * n_kv + h) * D + d];
+                    hpv[((pp * n_kv + h) * 64 + ps) * D + d] = hvc[(kp * n_kv + h) * D + d];
+                }
+            }
+        }
+        std::vector<std::int32_t> hl0 = {0}, hcl = {ctx_len};
+        DevBuf dq(hq.size() * 2), dkb(hkb.size() * 2), dvb(hvb.size() * 2);
+        DevBuf drk(hrk.size() * 2), drv(hrv.size() * 2), dpk(hpk.size() * 2), dpv(hpv.size() * 2);
+        DevBuf dbt(max_pages * 4), dl0(4), dcl(4), dout(blk_sz * n_q * D * 2);
+        DevBuf dsplit(blk_sz * n_q * 16 * (D + 4) * 4), dsdone(blk_sz * n_q * 4);
+        dq.upload(hq); dkb.upload(hkb); dvb.upload(hvb);
+        drk.upload(hrk); drv.upload(hrv); dpk.upload(hpk); dpv.upload(hpv);
+        dbt.upload(hbt); dl0.upload(hl0); dcl.upload(hcl); dsdone.zero();
+
+        ops::Inkling2KvTarget kv{};
+        kv.is_local = is_local; kv.ring_k = drk.ptr; kv.ring_v = drv.ptr; kv.ring_cap = ring_cap;
+        kv.paged_k = dpk.ptr; kv.paged_v = dpv.ptr;
+        kv.block_tables = static_cast<const std::int32_t*>(dbt.ptr); kv.max_logical_pages = max_pages;
+        Tensor tq = make_t(dq.ptr, DType::BF16, D, n_q, blk_sz);
+        Tensor tkb = make_t(dkb.ptr, DType::BF16, D, n_kv, blk_sz);
+        Tensor tvb = make_t(dvb.ptr, DType::BF16, D, n_kv, blk_sz);
+        Tensor to  = make_t(dout.ptr, DType::BF16, n_q * D, blk_sz);
+        ops::inkling2_mtp_block_attention(tq, tkb, tvb, kv, static_cast<const std::int32_t*>(dl0.ptr),
+                                          static_cast<const std::int32_t*>(dcl.ptr), 1, blk_sz,
+                                          n_q, n_kv, swa_win, to, stream,
+                                          static_cast<float*>(dsplit.ptr), 16,
+                                          static_cast<std::int32_t*>(dsdone.ptr));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (int v : dsdone.download<std::int32_t>(blk_sz * n_q)) {
+            if (v != 0) { throw std::runtime_error("mtp_block_attention split_done not reset to 0"); }
+        }
+        // Independent FP64 oracle on block pos 2
+        const int bi = 2;
+        const int ctx_start = is_local ? std::max(0, ctx_len - swa_win) : 0;
+        const int ctx_k     = ctx_len - ctx_start;
+        const int tot_k     = ctx_k + blk_sz;
+        std::vector<double> ref(n_q * D);
+        for (int qh = 0; qh < n_q; ++qh) {
+            const int kvh = qh / 3;
+            std::vector<double> scs(tot_k);
+            double mx = -1e30;
+            for (int ki = 0; ki < tot_k; ++ki) {
+                const auto* kp = (ki < ctx_k) ? &hkc[((ctx_start + ki) * n_kv + kvh) * D]
+                                              : &hkb[((ki - ctx_k) * n_kv + kvh) * D];
+                double dot = 0.0;
+                for (int d = 0; d < D; ++d) {
+                    dot += bf16_to_f32(hq[(bi * n_q + qh) * D + d]) * bf16_to_f32(kp[d]);
+                }
+                scs[ki] = dot / std::sqrt(static_cast<double>(D));
+                mx      = std::max(mx, scs[ki]);
+            }
+            double den = 0.0;
+            std::vector<double> acc(D, 0.0);
+            for (int ki = 0; ki < tot_k; ++ki) {
+                const auto* vp = (ki < ctx_k) ? &hvc[((ctx_start + ki) * n_kv + kvh) * D]
+                                              : &hvb[((ki - ctx_k) * n_kv + kvh) * D];
+                double p = std::exp(scs[ki] - mx);
+                den += p;
+                for (int d = 0; d < D; ++d) { acc[d] += p * bf16_to_f32(vp[d]); }
+            }
+            for (int d = 0; d < D; ++d) { ref[qh * D + d] = acc[d] / den; }
+        }
+        auto got_all = to_f64_from_bf16(dout.download<std::uint16_t>(blk_sz * n_q * D));
+        check_close(is_local ? "mtp_block_attn SWA long-ctx Split-KV (1100) vs FP64"
+                             : "mtp_block_attn Full long-ctx Split-KV (1100) vs FP64",
+                    ref, std::vector<double>(got_all.begin() + bi * n_q * D, got_all.begin() + (bi + 1) * n_q * D),
+                    1.5e-2, 1.5e-2);
+    }
+
+    // Wave 4: mtp_final_norm_extract_zero + fused mtp_markov_rnn_step (2 ping-pong steps vs unfused!)
+    {
+        const int B = 2, blk = 4, rank = 256, width = 2 * rank + 2 * H;
+        auto hhb = rand_bf16(rng, B * blk * H, 0.7f);
+        auto hnw = rand_bf16(rng, H, 1.0f);
+        auto hst = rand_bf16(rng, B * rank, 0.6f);
+        DevBuf dhb_r(hhb.size() * 2), dhb_f(hhb.size() * 2), dnw(H * 2);
+        DevBuf ddr_r(B * (blk - 1) * H * 2), ddr_f(B * (blk - 1) * H * 2), dst_z(B * rank * 2);
+        dhb_r.upload(hhb); dhb_f.upload(hhb); dnw.upload(hnw); dst_z.upload(hst);
+        Tensor thb_r = make_t(dhb_r.ptr, DType::BF16, H, B * blk);
+        Tensor thb_f = make_t(dhb_f.ptr, DType::BF16, H, B * blk);
+        Tensor tnw   = make_t(dnw.ptr, DType::BF16, H);
+        Tensor tdr_r = make_t(ddr_r.ptr, DType::BF16, H, B * (blk - 1));
+        Tensor tdr_f = make_t(ddr_f.ptr, DType::BF16, H, B * (blk - 1));
+        Tensor tst_z = make_t(dst_z.ptr, DType::BF16, rank, B);
+
+        ops::inkling2_rmsnorm(thb_r, &tnw, thb_r, eps, stream);
+        ops::inkling2_mtp_extract_draft_hiddens(thb_r, B, blk, tdr_r, stream);
+        ops::inkling2_mtp_final_norm_extract_zero(thb_f, tnw, eps, B, blk, tdr_f, tst_z, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        check_close("mtp_final_norm_extract_zero hidden", to_f64_from_bf16(dhb_r.download<std::uint16_t>(hhb.size())), to_f64_from_bf16(dhb_f.download<std::uint16_t>(hhb.size())), 1e-2, 1e-2);
+        check_close("mtp_final_norm_extract_zero draft", to_f64_from_bf16(ddr_r.download<std::uint16_t>(B * (blk - 1) * H)), to_f64_from_bf16(ddr_f.download<std::uint16_t>(B * (blk - 1) * H)), 1e-2, 1e-2);
+        for (std::uint16_t z : dst_z.download<std::uint16_t>(B * rank)) {
+            if (z != 0) { throw std::runtime_error("mtp_final_norm_extract_zero did not zero rnn_state"); }
+        }
+
+        // Fused Markov RNN step (2 sequential ping-pong steps) vs prep + bf16_linear + gates
+        auto hw1 = rand_bf16(rng, 64 * rank, 0.4f);
+        auto hfr = rand_bf16(rng, B * H, 0.4f);
+        auto hpw = rand_bf16(rng, 3 * rank * width, 0.05f);
+        auto hpb = rand_bf16(rng, 3 * rank, 0.2f);
+        std::vector<std::int32_t> hp0 = {5, 19}, hp1 = {33, 2};
+        DevBuf dw1(hw1.size() * 2), dfr(hfr.size() * 2), dpw(hpw.size() * 2), dpb(hpb.size() * 2);
+        DevBuf dp0(B * 4), dp1(B * 4);
+        DevBuf dst_ref(B * rank * 2), dst_pp0(B * rank * 2), dst_pp1(B * rank * 2);
+        DevBuf dz(B * width * 2), dpr(B * 3 * rank * 2), dlat_r(B * rank * 2), dlat_f(B * rank * 2);
+        dw1.upload(hw1); dfr.upload(hfr); dpw.upload(hpw); dpb.upload(hpb);
+        dp0.upload(hp0); dp1.upload(hp1);
+        dst_ref.upload(hst); dst_pp0.upload(hst);
+
+        Tensor tw1   = make_t(dw1.ptr, DType::BF16, rank, 64);
+        Tensor tfr   = make_t(dfr.ptr, DType::BF16, H, B);
+        Tensor tpw   = make_t(dpw.ptr, DType::BF16, width, 3 * rank);
+        Tensor tpb   = make_t(dpb.ptr, DType::BF16, 3 * rank);
+        Tensor tp0   = make_t(dp0.ptr, DType::I32, B), tp1 = make_t(dp1.ptr, DType::I32, B);
+        Tensor tst_r = make_t(dst_ref.ptr, DType::BF16, rank, B);
+        Tensor tst_0 = make_t(dst_pp0.ptr, DType::BF16, rank, B), tst_1 = make_t(dst_pp1.ptr, DType::BF16, rank, B);
+        Tensor tz    = make_t(dz.ptr, DType::BF16, width, B), tpr = make_t(dpr.ptr, DType::BF16, 3 * rank, B);
+        Tensor tlr   = make_t(dlat_r.ptr, DType::BF16, rank, B), tlf = make_t(dlat_f.ptr, DType::BF16, rank, B);
+
+        // Step 0 (block_pos = 1): pp0 -> pp1
+        ops::inkling2_mtp_markov_rnn_prep(tst_r, tp0, tw1, thb_r, 1, blk, tfr, tz, stream);
+        ops::inkling2_bf16_linear(tz, tpw, tpr, stream, &tpb);
+        ops::inkling2_mtp_markov_rnn_gates(tpr, tst_r, tlr, stream);
+        ops::inkling2_mtp_markov_rnn_step(tst_0, tp0, tw1, thb_r, 1, blk, tfr, tpw, tpb, tst_1, tlf, stream);
+
+        // Step 1 (block_pos = 2): pp1 -> pp0
+        ops::inkling2_mtp_markov_rnn_prep(tst_r, tp1, tw1, thb_r, 2, blk, tfr, tz, stream);
+        ops::inkling2_bf16_linear(tz, tpw, tpr, stream, &tpb);
+        ops::inkling2_mtp_markov_rnn_gates(tpr, tst_r, tlr, stream);
+        ops::inkling2_mtp_markov_rnn_step(tst_1, tp1, tw1, thb_r, 2, blk, tfr, tpw, tpb, tst_0, tlf, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        check_close("mtp_markov_rnn_step (2-step ping-pong) state", to_f64_from_bf16(dst_ref.download<std::uint16_t>(B * rank)), to_f64_from_bf16(dst_pp0.download<std::uint16_t>(B * rank)), 2e-2, 2e-2);
+        check_close("mtp_markov_rnn_step (2-step ping-pong) latent", to_f64_from_bf16(dlat_r.download<std::uint16_t>(B * rank)), to_f64_from_bf16(dlat_f.download<std::uint16_t>(B * rank)), 2e-2, 2e-2);
     }
 }
 

@@ -15,18 +15,18 @@ Measured on **2 × Tesla V100-SXM2 16 GB** (PCIe P2P, **150 W** power cap, CUDA 
 
 | Workload / Mode | NInfer (lossless NVFP4+MXFP8) | `llama.cpp` `UD-Q4_K_XL` | `llama.cpp` `UD-Q8_K_XL` |
 |---|---:|---:|---:|
-| Essay 256 tok, C=1 Normal / DSpark-2 (e2e) | **104.8** / **106.9 tok/s** | 30.7 tok/s | 29.3 tok/s |
-| Essay 256 tok, C=4 Normal / DSpark-2 (agg) | **238.0** / 175.4 tok/s | 78.3 tok/s | 55.9 tok/s |
-| Essay 256 tok, C=8 Normal (agg) | **313.2 tok/s** | — | — |
-| Code refactor 256 tok, C=1 Normal / DSpark-3 | 106.1 / **165.4 tok/s** | — | — |
-| 4,184-tok needle retrieval, C=1 Normal / DSpark-3 | 83.0 / **139.8 tok/s** | — | — |
+| Essay 256 tok, C=1 Normal / DSpark-2 (e2e) | **122.1** / **126.0 tok/s** | 30.7 tok/s | 29.3 tok/s |
+| Essay 256 tok, C=4 Normal / DSpark-2 (agg) | **269.0** / **211.9 tok/s** | 78.3 tok/s | 55.9 tok/s |
+| Essay 256 tok, C=8 Normal / DSpark-2 (agg) | **348.8** / **238.7 tok/s** | — | — |
+| Code refactor 256 tok, C=1 Normal / DSpark-2 / DSpark-3 (engine) | **128.5** / **168.9** / **166.7 tok/s** | — | — |
+| 4,274-tok needle retrieval, C=1 Normal / DSpark-3 | **114.2** / **181.8 tok/s** | — | — |
 | Cold prefill (512 / 4K / 16K / 64K tok), Normal (`chunk=1024`, `2048` at ≥16K) | **1,033.7** / **882.8** / **709.1** / **417.8 tok/s** | — | — |
 | Cold prefill (512 / 4K / 16K / 64K tok), DSpark-3 (`chunk=1024`) | 1,001.5 / 851.0 / 684.2 / 401.2 tok/s | — | — |
 
-Verified with **76/76** FP64/TP2 operator unit tests, **32/32** exact token parity against the
-PyTorch reference across Normal (Graph/Eager) and DSpark-2/3/7, HF `AutoTokenizer` parity,
-4K SWA-1024/Paged-KV long-context retrieval, full native 262K max-context planning, and `C=1..8`
-concurrent serving.
+Verified with **164/164** FP64/TP2 operator unit tests (0 B stack/spills on all hot kernels),
+**32/32** exact token parity against the PyTorch reference across Normal (Graph/Eager) and
+DSpark-2/3/5/7, HF `AutoTokenizer` parity, 4K SWA-1024/Paged-KV long-context retrieval, full native
+262K max-context planning, and `C=1..8` concurrent serving.
 **V100-32GB×2 compatibility**: memory planning and P2P/NVLink/UVA-fallback transport are
 hardware-agnostic (no 16 GB VRAM or PCIe-only assumptions), so 2× V100-32GB (NVLink, PCIe P2P, or
 non-P2P) and single-card V100-32GB (`--tp 1`) are supported by the same `sm_70` build (hardware

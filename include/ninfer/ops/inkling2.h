@@ -28,6 +28,14 @@ void inkling2_bf16_linear_triple(const Tensor& x0, const Tensor& w0, Tensor& out
                                  const Tensor& x2, const Tensor& w2, Tensor& out2,
                                  cudaStream_t stream);
 
+// 5-way projection (global layers: q_gate_r_sink + k_proj + v_proj + k_sconv_proj + v_sconv_proj in ONE launch!).
+void inkling2_bf16_linear_5way(const Tensor& x0, const Tensor& w0, Tensor& out0,
+                               const Tensor& x1, const Tensor& w1, Tensor& out1,
+                               const Tensor& x2, const Tensor& w2, Tensor& out2,
+                               const Tensor& x3, const Tensor& w3, Tensor& out3,
+                               const Tensor& x4, const Tensor& w4, Tensor& out4,
+                               cudaStream_t stream);
+
 // Output head + optional softcap + optional vocab-limit masking + optional local argmax.
 // w: BF16 [K, N_shard], x: BF16 [K, T].
 // If logits_out != nullptr: writes FP32 [N_shard, T] (softcapped, masked beyond valid_shard_cols).
@@ -85,18 +93,35 @@ void inkling2_attn_res_mix_pair(const void* const* src0, std::int32_t num_src0,
                                 std::int32_t num_q1, std::int32_t hidden, std::int32_t tokens,
                                 float eps, cudaStream_t stream);
 
+// Fused Block AttnRes (S in [1..5], Q=1) + Loop Control Prep (cur & msg -> z [4608, T]) in 1 launch!
+void inkling2_attn_res_mix_and_prep(const void* const* source_ptrs, std::int32_t num_sources,
+                                    const Tensor& query_f32, const Tensor& msg,
+                                    Tensor& out_mixed, Tensor& out_z, float eps,
+                                    cudaStream_t stream);
+
+// Fused Paired Cross-Pass AttnRes (S=2,Q=4 + S1=1..4,Q1=1/3) + QKV Loop Control Prep in 1 launch!
+void inkling2_attn_res_mix_pair_and_prep_qkv(
+    const void* const* bank_srcs, const Tensor& cp_q_f32, void* const* msg_outs,
+    const void* const* cur_srcs, std::int32_t num_cur_srcs, const Tensor& cur_q_f32,
+    void* const* cur_outs, std::int32_t num_cur_q, Tensor& out_z_3t, float eps,
+    cudaStream_t stream);
+
 // Cross-Pass Loop Controller:
 //   z = concat(rms_no_gamma(cur), rms_no_gamma(msg)) [4608, T]
 //   h = z @ down^T [64, T]
 //   [g_raw, f_raw] = h @ gain_forget^T [4608, T]
 //   out = (1 - tanh(f_raw)) * cur + tanh(g_raw) * msg
 // If post_norm_w != nullptr, fuses plain RMSNorm(out, post_norm_w, eps) directly!
+// skip_prep: true when inkling2_attn_res_mix_and_prep already populated scratch_z.
+// done_counter: optional pre-zeroed I32[1] enabling Last-CTA fused post-RMSNorm (zero extra launch!).
 void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& down_w,
                            const Tensor& gain_forget_w, const Tensor* post_norm_w,
                            Tensor& scratch_z, Tensor& scratch_h, Tensor& scratch_gf,
-                           Tensor& out, float eps, cudaStream_t stream);
+                           Tensor& out, float eps, cudaStream_t stream,
+                           bool skip_prep = false, std::int32_t* done_counter = nullptr);
 
 // Batched 3-controller launch (Q, K, V controllers simultaneously in grid.z=3 -> 192 fewer launches/step!).
+// done_counters: optional pre-zeroed I32[3] enabling Last-CTA fused post-RMSNorm for all 3 controllers!
 void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Tensor& cur2,
                                const Tensor& msg0, const Tensor& msg1, const Tensor& msg2,
                                const Tensor& down0, const Tensor& down1, const Tensor& down2,
@@ -104,7 +129,13 @@ void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Ten
                                const Tensor* norm0, const Tensor* norm1, const Tensor* norm2,
                                Tensor& scratch_z, Tensor& scratch_h, Tensor& scratch_gf,
                                Tensor& out0, Tensor& out1, Tensor& out2,
-                               float eps, cudaStream_t stream);
+                               float eps, cudaStream_t stream,
+                               bool skip_prep = false, std::int32_t* done_counters = nullptr);
+
+// Fused pass-transition copy: bank0 = src_bank0, bank_out = cur, cur = prelude (1 launch vs 3 D2D!).
+void inkling2_swap_pass_banks(const Tensor& src_bank0, const Tensor& prelude,
+                              Tensor& cur, Tensor& bank0, Tensor& bank_out,
+                              cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 3. Causal Short Convolutions (W = 4, Static & Dynamic, FP32 State)
@@ -199,12 +230,30 @@ void inkling2_sconv_kv_dynamic_verify(const Tensor& k, const Tensor& dyn_k, cons
 
 // Fused TP2 direct-P2P packet AllReduce + static SConv (+ optional residual_add & optional block_copy).
 // Participates in the exact same PeerEvents two-epoch packet protocol (blockDim=64, 8 BF16/thread).
+// `partial_in` may be BF16 or FP32 (when FP32, rounds to BF16 in registers before packet push,
+// eliminating separate cast_f32_to_bf16 launches for grouped MoE!).
 void inkling2_tp2_packet_allreduce_sconv_decode(
     const Tensor& partial_in, void* local_storage, void* peer_storage, std::size_t epoch_bytes,
     const Tensor& sconv_weight, float* state_pool, const std::int32_t* lane_ids,
     std::int32_t batch_size, std::size_t state_lane_stride, Tensor& out,
     const Tensor* residual_add, const Tensor* block_copy_src, Tensor* block_copy_dst,
     cudaStream_t stream);
+
+// Verify variant for DSpark speculative rounds (V in [2..8]): fuses TP2 packet AllReduce,
+// optional FP32->BF16 cast, optional block_copy, static SConv, residual add, and verify state save!
+void inkling2_tp2_packet_allreduce_sconv_verify(
+    const Tensor& partial_in, void* local_storage, void* peer_storage, std::size_t epoch_bytes,
+    const Tensor& sconv_weight, const float* state_pool, float* verify_states_pool,
+    const std::int32_t* lane_ids, std::int32_t batch_size, std::int32_t verify_len,
+    std::size_t state_lane_stride, std::int32_t max_verify_len, Tensor& out,
+    const Tensor* residual_add, const Tensor* block_copy_src, Tensor* block_copy_dst,
+    cudaStream_t stream);
+
+// Fused TP2 direct-P2P packet AllReduce + in-place residual_add (for DSpark MTP layers!).
+// Uses exact same 64-thread two-epoch packet protocol: residual_inout += bf16(rank0 + rank1).
+void inkling2_tp2_packet_allreduce_residual(
+    const Tensor& partial_in, void* local_storage, void* peer_storage, std::size_t epoch_bytes,
+    Tensor& residual_inout, cudaStream_t stream);
 
 // ---------------------------------------------------------------------------
 // 4. Inkling-2 Attention (L2Clip + Tau + RelBias + KV Append + SWA/Full Sink GQA)
@@ -223,9 +272,26 @@ struct Inkling2KvTarget {
     std::int32_t max_logical_pages = 0;
 };
 
+// Optional fused K/V SConv parameters for inkling2_attn_prologue (eliminates 48 kv_sconv launches!).
+struct Inkling2AttnSconvArgs {
+    bool is_dynamic             = false;
+    const void* k_weight        = nullptr; // BF16 [4, num_kv_heads * 128]
+    const void* v_weight        = nullptr; // BF16 [4, num_kv_heads * 128]
+    const void* k_dyn           = nullptr; // BF16 [4, num_kv_heads, T] (dynamic only)
+    const void* v_dyn           = nullptr; // BF16 [4, num_kv_heads, T] (dynamic only)
+    float* k_state_pool         = nullptr;
+    float* v_state_pool         = nullptr;
+    float* k_verify_pool        = nullptr; // non-null => verify mode (writes verify snapshots, keeps state_pool)
+    float* v_verify_pool        = nullptr;
+    std::size_t lane_stride     = 0;
+    std::int32_t q_per_lane     = 1;
+    std::int32_t max_verify_len = 0;
+};
+
 // Fused prologue:
 //   - Extracts Q, R from packed q_gate_r_sink [q_dim + q_dim + r_dim + n_q, T]
 //   - Applies q_l2_clip (+ tau if !is_local) -> q_out [head_dim, n_q, T]
+//   - Optionally applies static/dynamic K/V SConv directly in registers (sconv != nullptr)!
 //   - Applies k_l2_clip -> writes directly to KV cache at (lane_ids[t], positions[t])
 //   - Applies v_unweighted_rmsnorm -> writes directly to KV cache at (lane_ids[t], positions[t])
 //   - Applies rel_l2_clip (+ tau if !is_local) -> computes rel_bias [1024, n_q, T] (FP32) = R @ proj
@@ -236,20 +302,24 @@ void inkling2_attn_prologue(const Tensor& q_gate_r_sink, const Tensor& k_in, con
                             std::int32_t num_q_heads, std::int32_t num_kv_heads,
                             const Inkling2KvTarget& kv, bool is_local, float qk_clip_threshold,
                             float rel_clip_threshold, float log_floor, float log_alpha, float eps,
-                            Tensor& q_out, Tensor& rel_bias_out, cudaStream_t stream);
+                            Tensor& q_out, Tensor& rel_bias_out, cudaStream_t stream,
+                            const Inkling2AttnSconvArgs* sconv = nullptr);
 
 // Decode / Verify attention (batched across `batch_size` lanes, `q_per_lane` in [1..8]).
 // Reads Q [128, n_q, T], rel_bias [1024, n_q, T] (FP32), gate & sinks from packed q_gate_r_sink,
 // attends to cyclic SWA-1024 or paged global BF16 KV, applies sink absorption + sigmoid(gate),
 // writes BF16 out [n_q * 128, T].
-// split_scratch: FP32 scratch buffer of size >= batch_size * q_per_lane * n_q * max_splits * (128 + 2).
+// split_scratch: FP32 scratch buffer of size >= batch_size * q_per_lane * n_q * max_splits * (128 + 4).
+// split_done: optional pre-zeroed I32[batch_size * q_per_lane * num_q_heads] enabling single-launch
+// adaptive Last-CTA Q-head Split-KV (eliminates all 48 reduce launches and skips scratch at short context!).
 void inkling2_attn_decode_verify(const Tensor& q, const Tensor& q_gate_r_sink,
                                  const Tensor& rel_bias_f32, const Inkling2KvTarget& kv,
                                  const std::int32_t* lane_ids, const std::int32_t* q_positions,
                                  std::int32_t batch_size, std::int32_t q_per_lane,
                                  std::int32_t num_q_heads, std::int32_t num_kv_heads,
                                  std::int32_t swa_window, float* split_scratch,
-                                 std::int32_t max_splits, Tensor& out, cudaStream_t stream);
+                                 std::int32_t max_splits, Tensor& out, cudaStream_t stream,
+                                 std::int32_t* split_done = nullptr);
 
 // Prefill attention (single lane, `tokens` contiguous queries starting at `start_pos`).
 // Same exact relative-bias, sink absorption, SWA-1024 / global causal semantics + sigmoid(gate).
@@ -286,19 +356,25 @@ void inkling2_moe_route(const Tensor& router_logits_f32, const Tensor& router_bi
                         cudaStream_t stream);
 
 // Fused Router GEMV + sigmoid + bias top-8 (+ grouping for T <= 8) in ONE launch via Last-CTA sync!
+// prep_mode: 0 = router only; 1 = also prestage x for NVFP4 + zero accum_f32 (T=2..8);
+//            2 = also prestage x for MXFP8 + zero accum_f32 (T=2..8).
 void inkling2_moe_router_fused(const Tensor& x, const Tensor& router_weight,
                                const Tensor& router_bias_f32, float route_scale,
-                               Inkling2MoeScratch& scratch, cudaStream_t stream);
+                               Inkling2MoeScratch& scratch, cudaStream_t stream,
+                               std::int32_t prep_mode = 0);
 
 // NVFP4 MoE (layers 0..19): num_slabs = 1 (TP2, inter_local=576) or 2 (TP1, inter_local=1152).
 // w13_codes: U8 [num_slabs, 128, 1152, 1152], w13_scales: FP8_E4M3 [num_slabs, 128, 1152, 144]
 // w2_codes:  U8 [num_slabs, 128, 2304, 288],  w2_scales:  FP8_E4M3 [num_slabs, 128, 2304, 36]
+// skip_prep: true when inkling2_moe_router_fused already ran prep_mode=1.
+// skip_cast_out: true when caller consumes scratch.accum_f32 directly (e.g. fused TP2 AR+SConv).
 void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const void* w13_scales,
                                 const float* w13_amax, const float* w13_denom,
                                 const void* w2_codes, const void* w2_scales,
                                 const float* w2_amax, const float* w2_denom,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
-                                Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream);
+                                Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
+                                bool skip_prep = false, bool skip_cast_out = false);
 
 // MXFP8 MoE (layers 20..23): num_slabs = 1 (TP2) or 2 (TP1).
 // w13_codes: FP8_E4M3 [num_slabs, 128, 1152, 2304], w13_scales: U8 [num_slabs, 128, 1152, 72]
@@ -306,7 +382,8 @@ void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const vo
 void inkling2_moe_mxfp8_forward(const Tensor& x, const void* w13_codes, const void* w13_scales,
                                 const void* w2_codes, const void* w2_scales,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
-                                Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream);
+                                Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
+                                bool skip_prep = false, bool skip_cast_out = false);
 
 // ---------------------------------------------------------------------------
 // 6. DSpark MTP Drafter Ops
@@ -324,11 +401,27 @@ void inkling2_mtp_mix_rmsnorm_indexed(const Tensor& target_hiddens, const std::i
                                       const Tensor& norm_weight, float eps, Tensor& out,
                                       cudaStream_t stream);
 
+// Batched 3-layer ctx mix_rmsnorm + f_rnn mix_rmsnorm in ONE launch (eliminates 3 launches!).
+void inkling2_mtp_mix_rmsnorm_batch3_and_frnn(
+    const Tensor& target_hiddens, const std::int32_t* ctx_src_indices, std::int32_t ctx_count,
+    const std::int32_t* frnn_src_indices, const std::int32_t* frnn_dst_indices,
+    std::int32_t frnn_count, const Tensor& fuse_weight,
+    const Tensor& norm0, const Tensor& norm1, const Tensor& norm2, const Tensor& frnn_norm,
+    float eps, Tensor& out0, Tensor& out1, Tensor& out2, Tensor& out_frnn, cudaStream_t stream);
+
 // Context KV norm + NeoX RoPE + write into MTP KV cache (cyclic SWA-1024 for layers 0,2; paged for layer 1).
 void inkling2_mtp_ctx_kv_write(const Tensor& kv_ctx, const Tensor& k_norm_ctx_w,
                                const std::int32_t* positions, const std::int32_t* lane_ids,
                                std::int32_t tokens, std::int32_t num_kv_heads, float rope_theta,
                                float eps, const Inkling2KvTarget& kv, cudaStream_t stream);
+
+// Batched 3-layer context KV write in ONE launch!
+void inkling2_mtp_ctx_kv_write_3(const Tensor& kv_ctx0, const Tensor& k_norm0, const Inkling2KvTarget& kv0,
+                                 const Tensor& kv_ctx1, const Tensor& k_norm1, const Inkling2KvTarget& kv1,
+                                 const Tensor& kv_ctx2, const Tensor& k_norm2, const Inkling2KvTarget& kv2,
+                                 const std::int32_t* positions, const std::int32_t* lane_ids,
+                                 std::int32_t tokens, std::int32_t num_kv_heads, float rope_theta,
+                                 float eps, cudaStream_t stream);
 
 // Block Q/K norm + NeoX RoPE (in-place / split from packed qkv [q+k+v, T]).
 void inkling2_mtp_block_qkv_rope(const Tensor& qkv, const Tensor& q_norm_w, const Tensor& k_norm_w,
@@ -337,14 +430,19 @@ void inkling2_mtp_block_qkv_rope(const Tensor& qkv, const Tensor& q_norm_w, cons
                                  float rope_theta, float eps, Tensor& q_out, Tensor& k_out,
                                  Tensor& v_out, cudaStream_t stream);
 
-// Non-causal block attention over [ctx_kv_window, block_kv] for `batch_size` lanes, `block_size=8`.
+// Non-causal block attention over [ctx_kv_window, block_kv] for `batch_size` lanes, `block_size<=8`.
 // `ctx_lens[b]` is number of context KV tokens before the block's anchor position.
+// Optional `split_scratch` ([132, max_splits, num_q_heads, batch_size * block_size] FP32) and
+// pre-zeroed `split_done` ([num_q_heads * batch_size * block_size] I32) enable single-launch
+// Q-head Adaptive Last-CTA Split-KV saturating all 80 SMs across both short and 4K+ context!
 void inkling2_mtp_block_attention(const Tensor& q, const Tensor& k_block, const Tensor& v_block,
                                   const Inkling2KvTarget& kv, const std::int32_t* lane_ids,
                                   const std::int32_t* ctx_lens, std::int32_t batch_size,
                                   std::int32_t block_size, std::int32_t num_q_heads,
                                   std::int32_t num_kv_heads, std::int32_t swa_window,
-                                  Tensor& out, cudaStream_t stream);
+                                  Tensor& out, cudaStream_t stream,
+                                  float* split_scratch = nullptr, std::int32_t max_splits = 1,
+                                  std::int32_t* split_done = nullptr);
 
 // Standard SiLU(gate) * up on packed gate_up [2*inter, T] (split halves: gate = [0..inter), up = [inter..2*inter)).
 void inkling2_silu_mul_packed(const Tensor& gate_up, Tensor& out, cudaStream_t stream);
@@ -359,6 +457,14 @@ void inkling2_mtp_markov_rnn_prep(const Tensor& state, const Tensor& prev_tokens
 
 void inkling2_mtp_markov_rnn_gates(const Tensor& proj, Tensor& state, Tensor& latent_out,
                                    cudaStream_t stream);
+
+// Fused Markov RNN step (prep + [5120->768] BF16 linear + gates) in ONE launch (ZERO z/proj HBM!).
+// Uses disjoint state_in / state_out ping-pong buffers for 100% race-free parallel execution.
+void inkling2_mtp_markov_rnn_step(const Tensor& state_in, const Tensor& prev_tokens,
+                                  const Tensor& markov_w1, const Tensor& hidden_block,
+                                  std::int32_t block_pos, std::int32_t block_size,
+                                  const Tensor& f_rnn, const Tensor& proj_w, const Tensor& proj_b,
+                                  Tensor& state_out, Tensor& latent_out, cudaStream_t stream);
 
 // Assemble draft block embeddings: slot 0 = anchor_embed[b], slots 1..block_size-1 = mask_embed.
 void inkling2_mtp_build_block_embed(const Tensor& anchor_embed, const Tensor& mask_embed,
@@ -375,5 +481,11 @@ void inkling2_bf16_transpose_2d(const Tensor& src, Tensor& dst, cudaStream_t str
 // Pack slice of BF16 [H, B * block_size] at positions 1..block_size-1 into [H, B * (block_size - 1)].
 void inkling2_mtp_extract_draft_hiddens(const Tensor& hidden_block, std::int32_t batch_size,
                                         std::int32_t block_size, Tensor& out, cudaStream_t stream);
+
+// Fused MTP final RMSNorm (in-place on hidden_block) + extract draft hiddens + zero RNN state (1 launch!).
+void inkling2_mtp_final_norm_extract_zero(Tensor& hidden_block, const Tensor& final_norm_w,
+                                          float eps, std::int32_t batch_size,
+                                          std::int32_t block_size, Tensor& draft_out,
+                                          Tensor& rnn_state_to_zero, cudaStream_t stream);
 
 } // namespace ninfer::ops

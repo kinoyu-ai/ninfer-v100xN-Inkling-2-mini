@@ -46,94 +46,58 @@ __device__ __forceinline__ uint4 ld_global_cg_u4(const void* ptr) {
 
 // ============================================================================
 // 1. T == 1 High-Bandwidth Volta BF16 GEMV
-//    - Multi-row per warp (RowsPerWarp=4) + 4 accumulator chains + ld.global.cg
-//      streaming weight loads (keeps x hot in L1, hides FMA latency, 4x x reuse!).
+//    - 1 row/warp (4 rows/CTA -> 1075 CTAs QKV / 576 CTAs O-proj) + 2-deep
+//      software prefetch (765 GB/s QKV, 673 GB/s O-proj on V100, <= 40 regs!).
 //    - Multi-warp Split-K (WarpsPerRow=8) for small N <= 512 (saturates all 80 SMs!).
 // ============================================================================
 
-template <typename OutT, int WarpsPerBlock, int RowsPerWarp>
-__global__ __launch_bounds__(WarpsPerBlock * 32, 4) void bf16_gemv_multirow_kernel(
+template <typename OutT>
+__global__ __launch_bounds__(128, 8) void bf16_gemv_1rpw_pf2_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
     OutT* __restrict__ out, const __nv_bfloat16* __restrict__ bias,
     const __nv_bfloat16* __restrict__ residual, int n, int k) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row0 = (blockIdx.x * WarpsPerBlock + warp) * RowsPerWarp;
-    if (row0 >= n) { return; }
+    const int row  = blockIdx.x * 4 + warp;
+    if (row >= n) { return; }
 
-    const int k8 = k >> 3;
-    float acc[RowsPerWarp][4] = {};
+    const int k8    = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    const uint4* xp = reinterpret_cast<const uint4*>(x);
 
-    const bool full_group = (row0 + RowsPerWarp <= n);
-    if (full_group) {
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (lane < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + lane);
+        uint4 x_cur = __ldg(xp + lane);
         for (int i = lane; i < k8; i += 32) {
-            // Issue ALL RowsPerWarp weight loads + x load BEFORE conversion/FMAs -> 4x HBM2 MLP!
-            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x) + i);
-            uint4 wv[RowsPerWarp];
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                wv[r] = ld_global_cg_u4(
-                    reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0 + r) * k) + i);
+            uint4 w_nxt{}, x_nxt{};
+            if (i + 32 < k8) {
+                w_nxt = ld_global_cg_u4(wp + i + 32);
+                x_nxt = __ldg(xp + i + 32);
             }
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float xf[8];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f = __bfloat1622float2(xb[j]);
-                xf[2 * j]      = f.x;
-                xf[2 * j + 1]  = f.y;
-            }
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv[r]);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 wf = __bfloat1622float2(wb[j]);
-                    acc[r][j]       = fmaf(wf.x, xf[2 * j], fmaf(wf.y, xf[2 * j + 1], acc[r][j]));
-                }
-            }
-        }
-    } else {
-        for (int i = lane; i < k8; i += 32) {
-            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float xf[8];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f = __bfloat1622float2(xb[j]);
-                xf[2 * j]      = f.x;
-                xf[2 * j + 1]  = f.y;
-            }
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                if (row0 + r < n) {
-                    const uint4 wv = ld_global_cg_u4(
-                        reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0 + r) * k) + i);
-                    const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 wf = __bfloat1622float2(wb[j]);
-                        acc[r][j]       = fmaf(wf.x, xf[2 * j], fmaf(wf.y, xf[2 * j + 1], acc[r][j]));
-                    }
-                }
-            }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&x_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]), x0 = __bfloat1622float2(xb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]), x1 = __bfloat1622float2(xb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]), x2 = __bfloat1622float2(xb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]), x3 = __bfloat1622float2(xb[3]);
+            a0 = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, a0));
+            a1 = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, a1));
+            a2 = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, a2));
+            a3 = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, a3));
+            w_cur = w_nxt;
+            x_cur = x_nxt;
         }
     }
 
-#pragma unroll
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const int row = row0 + r;
-        if (row < n) {
-            float sum = warp_reduce_sum((acc[r][0] + acc[r][1]) + (acc[r][2] + acc[r][3]));
-            if (lane == 0) {
-                if (bias != nullptr) { sum += __bfloat162float(__ldg(bias + row)); }
-                if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + row)); }
-                if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
-                    out[row] = __float2bfloat16_rn(sum);
-                } else {
-                    out[row] = sum;
-                }
-            }
+    float sum = warp_reduce_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) {
+        if (bias != nullptr) { sum += __bfloat162float(__ldg(bias + row)); }
+        if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + row)); }
+        if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
+            out[row] = __float2bfloat16_rn(sum);
+        } else {
+            out[row] = sum;
         }
     }
 }
@@ -210,87 +174,187 @@ __global__ __launch_bounds__(WarpsPerRow * 32, 2) void bf16_small_t_splitk_kerne
     }
 }
 
-template <typename OutT, int ActiveT, int WarpsPerBlock, int RowsPerWarp>
-__global__ __launch_bounds__(WarpsPerBlock * 32, 2) void bf16_small_t_wpr_kernel(
+// 16 threads/row (8 rows/CTA, 256B coalesced, 2-deep weight prefetch, low registers -> 709 GB/s T=4!)
+template <typename OutT, int ActiveT>
+__global__ __launch_bounds__(128, 6) void bf16_small_t_16tpr_pf2_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    OutT* __restrict__ out, const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ residual, int n, int k) {
+    const int r_loc = threadIdx.x >> 4; // 0..7
+    const int kl    = threadIdx.x & 15; // 0..15
+    const int row   = blockIdx.x * 8 + r_loc;
+    if (row >= n) { return; }
+
+    const int k8       = k >> 3;
+    const uint4* wp    = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[ActiveT] = {};
+
+    if (kl < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + kl);
+        for (int i = kl; i < k8; i += 16) {
+            uint4 w_nxt{};
+            if (i + 16 < k8) { w_nxt = ld_global_cg_u4(wp + i + 16); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
+#pragma unroll
+            for (int ti = 0; ti < ActiveT; ++ti) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
+            }
+            w_cur = w_nxt;
+        }
+    }
+
+    const float bval = (kl == 0 && bias != nullptr) ? __bfloat162float(__ldg(bias + row)) : 0.0f;
+#pragma unroll
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        float sum = acc[ti];
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 8, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 4, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1, 16);
+        if (kl == 0) {
+            sum += bval;
+            const std::int64_t idx = static_cast<std::int64_t>(ti) * n + row;
+            if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + idx)); }
+            if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
+                out[idx] = __float2bfloat16_rn(sum);
+            } else {
+                out[idx] = sum;
+            }
+        }
+    }
+}
+
+// 32 threads/row (4 rows/CTA -> 576 CTAs for O-proj!) with 2-deep weight prefetch for T <= 4
+template <typename OutT, int ActiveT>
+__global__ __launch_bounds__(128, 6) void bf16_small_t_32tpr_pf2_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
     OutT* __restrict__ out, const __nv_bfloat16* __restrict__ bias,
     const __nv_bfloat16* __restrict__ residual, int n, int k) {
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row0 = (blockIdx.x * WarpsPerBlock + warp) * RowsPerWarp;
-    if (row0 >= n) { return; }
+    const int row  = blockIdx.x * 4 + warp;
+    if (row >= n) { return; }
 
-    const int k8                   = k >> 3;
-    float acc[RowsPerWarp][ActiveT] = {};
+    const int k8       = k >> 3;
+    const uint4* wp    = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[ActiveT] = {};
 
-    for (int i = lane; i < k8; i += 32) {
-        // Load & convert all ActiveT activations ONCE and issue all RowsPerWarp weight loads in parallel!
-        float xf[ActiveT][8];
+    if (lane < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + lane);
+        for (int i = lane; i < k8; i += 32) {
+            uint4 w_nxt{};
+            if (i + 32 < k8) { w_nxt = ld_global_cg_u4(wp + i + 32); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
 #pragma unroll
-        for (int ti = 0; ti < ActiveT; ++ti) {
-            const uint4 xp = __ldg(reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(ti) * k) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xp);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f  = __bfloat1622float2(xb[j]);
-                xf[ti][2 * j]     = f.x;
-                xf[ti][2 * j + 1] = f.y;
+            for (int ti = 0; ti < ActiveT; ++ti) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
             }
-        }
-        uint4 wv[RowsPerWarp];
-#pragma unroll
-        for (int r = 0; r < RowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < n) {
-                wv[r] = ld_global_cg_u4(
-                    reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k) + i);
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < RowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < n) {
-                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv[r]);
-                float wf[8];
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __bfloat1622float2(wb[j]);
-                    wf[2 * j]      = f.x;
-                    wf[2 * j + 1]  = f.y;
-                }
-#pragma unroll
-                for (int ti = 0; ti < ActiveT; ++ti) {
-                    float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        a0 = fmaf(wf[2 * j], xf[ti][2 * j], a0);
-                        a1 = fmaf(wf[2 * j + 1], xf[ti][2 * j + 1], a1);
-                    }
-                    acc[r][ti] += a0 + a1;
-                }
-            }
+            w_cur = w_nxt;
         }
     }
 
+    const float bval = (lane == 0 && bias != nullptr) ? __bfloat162float(__ldg(bias + row)) : 0.0f;
 #pragma unroll
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const int row = row0 + r;
-        if (row < n) {
-            const float bval = (bias != nullptr) ? __bfloat162float(__ldg(bias + row)) : 0.0f;
-#pragma unroll
-            for (int ti = 0; ti < ActiveT; ++ti) {
-                float sum = warp_reduce_sum(acc[r][ti]);
-                if (lane == 0) {
-                    sum += bval;
-                    const std::int64_t idx = static_cast<std::int64_t>(ti) * n + row;
-                    if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + idx)); }
-                    if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
-                        out[idx] = __float2bfloat16_rn(sum);
-                    } else {
-                        out[idx] = sum;
-                    }
-                }
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        float sum = warp_reduce_sum(acc[ti]);
+        if (lane == 0) {
+            sum += bval;
+            const std::int64_t idx = static_cast<std::int64_t>(ti) * n + row;
+            if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + idx)); }
+            if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
+                out[idx] = __float2bfloat16_rn(sum);
+            } else {
+                out[idx] = sum;
+            }
+        }
+    }
+}
+
+// Coalesced T = 9..16 SIMT kernel (16tpr, reads weights ONCE at ~550 GB/s -> 2x faster than QPN!)
+template <typename OutT>
+__global__ __launch_bounds__(128, 4) void bf16_t9_16_16tpr_pf2_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    OutT* __restrict__ out, const __nv_bfloat16* __restrict__ bias,
+    const __nv_bfloat16* __restrict__ residual, int n, int k, int t) {
+    const int r_loc = threadIdx.x >> 4;
+    const int kl    = threadIdx.x & 15;
+    const int row   = blockIdx.x * 8 + r_loc;
+    if (row >= n) { return; }
+
+    const int k8  = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[16] = {};
+
+    if (kl < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + kl);
+        for (int i = kl; i < k8; i += 16) {
+            uint4 w_nxt{};
+            if (i + 16 < k8) { w_nxt = ld_global_cg_u4(wp + i + 16); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
+            for (int ti = 0; ti < t; ++ti) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
+            }
+            w_cur = w_nxt;
+        }
+    }
+
+    const float bval = (kl == 0 && bias != nullptr) ? __bfloat162float(__ldg(bias + row)) : 0.0f;
+    for (int ti = 0; ti < t; ++ti) {
+        float sum = acc[ti];
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 8, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 4, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1, 16);
+        if (kl == 0) {
+            sum += bval;
+            const std::int64_t idx = static_cast<std::int64_t>(ti) * n + row;
+            if (residual != nullptr) { sum += __bfloat162float(__ldg(residual + idx)); }
+            if constexpr (std::is_same_v<OutT, __nv_bfloat16>) {
+                out[idx] = __float2bfloat16_rn(sum);
+            } else {
+                out[idx] = sum;
             }
         }
     }
@@ -304,18 +368,14 @@ void dispatch_bf16_small_t_fixed(const __nv_bfloat16* x, const __nv_bfloat16* w,
         constexpr int kSplit = 8;
         bf16_small_t_splitk_kernel<OutT, ActiveT, kSplit>
             <<<n, kSplit * 32, 0, stream>>>(x, w, out, bias, residual, n, k);
-    } else if (ActiveT <= 4) {
-        constexpr int kWarps = 4;
-        constexpr int kRpw   = 2;
-        const int blocks     = (n + kWarps * kRpw - 1) / (kWarps * kRpw);
-        bf16_small_t_wpr_kernel<OutT, ActiveT, kWarps, kRpw>
-            <<<blocks, kWarps * 32, 0, stream>>>(x, w, out, bias, residual, n, k);
+    } else if (ActiveT <= 4 && n <= 2560 && k >= 1024) {
+        const int blocks = (n + 3) / 4;
+        bf16_small_t_32tpr_pf2_kernel<OutT, ActiveT>
+            <<<blocks, 128, 0, stream>>>(x, w, out, bias, residual, n, k);
     } else {
-        constexpr int kWarps = 4;
-        constexpr int kRpw   = 1;
-        const int blocks     = (n + kWarps * kRpw - 1) / (kWarps * kRpw);
-        bf16_small_t_wpr_kernel<OutT, ActiveT, kWarps, kRpw>
-            <<<blocks, kWarps * 32, 0, stream>>>(x, w, out, bias, residual, n, k);
+        const int blocks = (n + 7) / 8;
+        bf16_small_t_16tpr_pf2_kernel<OutT, ActiveT>
+            <<<blocks, 128, 0, stream>>>(x, w, out, bias, residual, n, k);
     }
 }
 
@@ -535,20 +595,20 @@ __global__ __launch_bounds__(128, 2) void bf16_volta_tiled_gemm_kernel(
 //    softcap * tanhf(v / softcap) ONCE per token to the winning scalar in reduce_block_argmax!
 // ============================================================================
 
-template <int ActiveT, int WarpsPerBlock, int RowsPerWarp>
-__global__ __launch_bounds__(WarpsPerBlock * 32, 2) void unembed_small_t_argmax_kernel(
+// 2-deep software-prefetched Unembed Argmax: 883 GB/s at T=1 (32tpr) & 798 GB/s at T=4 (16tpr)!
+template <int ActiveT, int Tpr>
+__global__ __launch_bounds__(128, 6) void unembed_small_t_argmax_pf2_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
     int valid_cols, int k, int num_blocks, float* __restrict__ block_vals,
     std::int32_t* __restrict__ block_ids) {
-    __shared__ float s_val[ActiveT][WarpsPerBlock];
-    __shared__ int s_idx[ActiveT][WarpsPerBlock];
+    constexpr int Rpb = 128 / Tpr; // 4 (Tpr=32) or 8 (Tpr=16)
+    __shared__ float s_val[ActiveT][Rpb];
+    __shared__ int s_idx[ActiveT][Rpb];
 
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int k8   = k >> 3;
+    const int r_loc = threadIdx.x / Tpr;
+    const int kl    = threadIdx.x & (Tpr - 1);
+    const int k8    = k >> 3;
 
-    // Grid-stride across vocab rows in chunks of (WarpsPerBlock * RowsPerWarp) so num_blocks = 320
-    // (4 full waves on 80 SMs -> tiny reduction table: only 320 floats/token!)
     float best_v[ActiveT];
     int best_id[ActiveT];
 #pragma unroll
@@ -557,76 +617,66 @@ __global__ __launch_bounds__(WarpsPerBlock * 32, 2) void unembed_small_t_argmax_
         best_id[ti] = 0;
     }
 
-    const int stride_rows = num_blocks * WarpsPerBlock * RowsPerWarp;
-    for (int row0 = (blockIdx.x * WarpsPerBlock + warp) * RowsPerWarp; row0 < valid_cols;
-         row0 += stride_rows) {
-        float acc[RowsPerWarp][ActiveT] = {};
-        for (int i = lane; i < k8; i += 32) {
-            uint4 x_packs[ActiveT];
+    const int stride_rows = num_blocks * Rpb;
+    for (int row = blockIdx.x * Rpb + r_loc; row < valid_cols; row += stride_rows) {
+        const uint4* wp    = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+        float acc[ActiveT] = {};
+        if (kl < k8) {
+            uint4 w_cur = ld_global_cg_u4(wp + kl);
+            for (int i = kl; i < k8; i += Tpr) {
+                uint4 w_nxt{};
+                if (i + Tpr < k8) { w_nxt = ld_global_cg_u4(wp + i + Tpr); }
+                const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+                const float2 w0 = __bfloat1622float2(wb[0]);
+                const float2 w1 = __bfloat1622float2(wb[1]);
+                const float2 w2 = __bfloat1622float2(wb[2]);
+                const float2 w3 = __bfloat1622float2(wb[3]);
 #pragma unroll
-            for (int ti = 0; ti < ActiveT; ++ti) {
-                x_packs[ti] = __ldg(reinterpret_cast<const uint4*>(
-                    x + static_cast<std::int64_t>(ti) * k) + i);
-            }
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                const int row = row0 + r;
-                if (row < valid_cols) {
-                    const uint4 wv = ld_global_cg_u4(
-                        reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k) + i);
-                    const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-                    float wf[8];
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 f = __bfloat1622float2(wb[j]);
-                        wf[2 * j]      = f.x;
-                        wf[2 * j + 1]  = f.y;
-                    }
-#pragma unroll
-                    for (int ti = 0; ti < ActiveT; ++ti) {
-                        const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&x_packs[ti]);
-                        float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-                        for (int j = 0; j < 4; ++j) {
-                            const float2 xf = __bfloat1622float2(xb[j]);
-                            a0              = fmaf(wf[2 * j], xf.x, a0);
-                            a1              = fmaf(wf[2 * j + 1], xf.y, a1);
-                        }
-                        acc[r][ti] += a0 + a1;
-                    }
+                for (int ti = 0; ti < ActiveT; ++ti) {
+                    const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                        x + static_cast<std::int64_t>(ti) * k) + i);
+                    const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                    const float2 x0 = __bfloat1622float2(xb[0]);
+                    const float2 x1 = __bfloat1622float2(xb[1]);
+                    const float2 x2 = __bfloat1622float2(xb[2]);
+                    const float2 x3 = __bfloat1622float2(xb[3]);
+                    acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                    acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                    acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                    acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
                 }
+                w_cur = w_nxt;
             }
         }
 #pragma unroll
-        for (int r = 0; r < RowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < valid_cols) {
+        for (int ti = 0; ti < ActiveT; ++ti) {
+            float val = acc[ti];
 #pragma unroll
-                for (int ti = 0; ti < ActiveT; ++ti) {
-                    const float val = warp_reduce_sum(acc[r][ti]);
-                    if (lane == 0 && (val > best_v[ti] || (val == best_v[ti] && row < best_id[ti]))) {
-                        best_v[ti]  = val;
-                        best_id[ti] = row;
-                    }
-                }
+            for (int off = Tpr >> 1; off > 0; off >>= 1) {
+                val += __shfl_xor_sync(0xFFFFFFFFu, val, off, Tpr);
+            }
+            if (kl == 0 && (val > best_v[ti] || (val == best_v[ti] && row < best_id[ti]))) {
+                best_v[ti]  = val;
+                best_id[ti] = row;
             }
         }
     }
 
-    if (lane == 0) {
+    if (kl == 0) {
 #pragma unroll
         for (int ti = 0; ti < ActiveT; ++ti) {
-            s_val[ti][warp] = best_v[ti];
-            s_idx[ti][warp] = best_id[ti];
+            s_val[ti][r_loc] = best_v[ti];
+            s_idx[ti][r_loc] = best_id[ti];
         }
     }
     __syncthreads();
 
-    if (warp == 0) {
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
 #pragma unroll
         for (int ti = 0; ti < ActiveT; ++ti) {
-            float v = (lane < WarpsPerBlock) ? s_val[ti][lane] : -std::numeric_limits<float>::infinity();
-            int id  = (lane < WarpsPerBlock) ? s_idx[ti][lane] : 0;
+            float v = (lane < Rpb) ? s_val[ti][lane] : -std::numeric_limits<float>::infinity();
+            int id  = (lane < Rpb) ? s_idx[ti][lane] : 0;
             warp_reduce_argmax(v, id);
             if (lane == 0) {
                 block_vals[static_cast<std::int64_t>(ti) * num_blocks + blockIdx.x] = v;
@@ -893,41 +943,104 @@ __global__ __launch_bounds__(256, 2) void markov_logits_argmax_batched_kernel(
     const int r_begin        = blockIdx.x * rows_per_block;
     const int r_end          = min(valid_cols, r_begin + rows_per_block);
 
-    for (int v = r_begin + warp; v < r_end; v += kWarps) {
-        const uint4 wv = ld_global_cg_u4(
-            fold_w + static_cast<std::int64_t>(v) * 256 + lane * 8);
-        const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-        float wf[8];
+    // 4 rows/warp/iter -> 4x HBM2 MLP on fold_w + coalesced prefetch of fold_b & base_logits!
+    for (int v0 = r_begin + warp * 4; v0 < r_end; v0 += kWarps * 4) {
+        if (v0 + 3 < r_end) {
+            const uint4 wv0 = ld_global_cg_u4(fold_w + static_cast<std::int64_t>(v0 + 0) * 256 + lane * 8);
+            const uint4 wv1 = ld_global_cg_u4(fold_w + static_cast<std::int64_t>(v0 + 1) * 256 + lane * 8);
+            const uint4 wv2 = ld_global_cg_u4(fold_w + static_cast<std::int64_t>(v0 + 2) * 256 + lane * 8);
+            const uint4 wv3 = ld_global_cg_u4(fold_w + static_cast<std::int64_t>(v0 + 3) * 256 + lane * 8);
+
+            // Coalesced prefetch of 4 fold_b + 4 base_logits across lanes 0..3 while fold_w streams!
+            const float fb_mine = (lane < 4) ? __ldg(fold_b + v0 + lane) : 0.0f;
+            float base_mine[MaxB];
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-            const float2 f = __bfloat1622float2(wb[j]);
-            wf[2 * j]      = f.x;
-            wf[2 * j + 1]  = f.y;
-        }
-        const float fb_v = (lane == 0) ? __ldg(fold_b + v) : 0.0f;
-#pragma unroll
-        for (int b = 0; b < MaxB; ++b) {
-            if (b < batch) {
-                float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    a0 = fmaf(wf[2 * j], lx[b][2 * j], a0);
-                    a1 = fmaf(wf[2 * j + 1], lx[b][2 * j + 1], a1);
-                }
-                const float acc = warp_reduce_sum(a0 + a1);
-                if (lane == 0) {
+            for (int b = 0; b < MaxB; ++b) {
+                if (b < batch && lane < 4) {
                     const std::int64_t brow =
                         static_cast<std::int64_t>(b) * base_row_stride + base_row_offset;
-                    float base_v;
                     if constexpr (std::is_same_v<BaseT, __nv_bfloat16>) {
-                        base_v = __bfloat162float(__ldg(base_logits + brow * n_shard + v));
+                        base_mine[b] = __bfloat162float(__ldg(base_logits + brow * n_shard + v0 + lane));
                     } else {
-                        base_v = __ldg(base_logits + brow * n_shard + v);
+                        base_mine[b] = __ldg(base_logits + brow * n_shard + v0 + lane);
                     }
-                    const float total = base_v + acc + fb_v;
-                    if (total > best_v[b] || (total == best_v[b] && v < best_id[b])) {
-                        best_v[b]  = total;
-                        best_id[b] = v;
+                } else {
+                    base_mine[b] = 0.0f;
+                }
+            }
+
+            const uint4 wvs[4] = {wv0, wv1, wv2, wv3};
+#pragma unroll
+            for (int r = 0; r < 4; ++r) {
+                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wvs[r]);
+                float wf[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(wb[j]);
+                    wf[2 * j]      = f.x;
+                    wf[2 * j + 1]  = f.y;
+                }
+                const float fb_r = __shfl_sync(0xFFFFFFFFu, fb_mine, r);
+                const int vr     = v0 + r;
+#pragma unroll
+                for (int b = 0; b < MaxB; ++b) {
+                    if (b < batch) {
+                        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            a0 = fmaf(wf[2 * j], lx[b][2 * j], a0);
+                            a1 = fmaf(wf[2 * j + 1], lx[b][2 * j + 1], a1);
+                        }
+                        const float acc    = warp_reduce_sum(a0 + a1);
+                        const float base_r = __shfl_sync(0xFFFFFFFFu, base_mine[b], r);
+                        if (lane == 0) {
+                            const float total = base_r + acc + fb_r;
+                            if (total > best_v[b] || (total == best_v[b] && vr < best_id[b])) {
+                                best_v[b]  = total;
+                                best_id[b] = vr;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            for (int v = v0; v < r_end; ++v) {
+                const uint4 wv = ld_global_cg_u4(
+                    fold_w + static_cast<std::int64_t>(v) * 256 + lane * 8);
+                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
+                float wf[8];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const float2 f = __bfloat1622float2(wb[j]);
+                    wf[2 * j]      = f.x;
+                    wf[2 * j + 1]  = f.y;
+                }
+                const float fb_v = (lane == 0) ? __ldg(fold_b + v) : 0.0f;
+#pragma unroll
+                for (int b = 0; b < MaxB; ++b) {
+                    if (b < batch) {
+                        float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            a0 = fmaf(wf[2 * j], lx[b][2 * j], a0);
+                            a1 = fmaf(wf[2 * j + 1], lx[b][2 * j + 1], a1);
+                        }
+                        const float acc = warp_reduce_sum(a0 + a1);
+                        if (lane == 0) {
+                            const std::int64_t brow =
+                                static_cast<std::int64_t>(b) * base_row_stride + base_row_offset;
+                            float base_v;
+                            if constexpr (std::is_same_v<BaseT, __nv_bfloat16>) {
+                                base_v = __bfloat162float(__ldg(base_logits + brow * n_shard + v));
+                            } else {
+                                base_v = __ldg(base_logits + brow * n_shard + v);
+                            }
+                            const float total = base_v + acc + fb_v;
+                            if (total > best_v[b] || (total == best_v[b] && v < best_id[b])) {
+                                best_v[b]  = total;
+                                best_id[b] = v;
+                            }
+                        }
                     }
                 }
             }
@@ -973,11 +1086,9 @@ void dispatch_bf16_linear(const __nv_bfloat16* x, const __nv_bfloat16* w, OutT* 
             bf16_small_t_splitk_kernel<OutT, 1, kSplit>
                 <<<n, kSplit * 32, 0, stream>>>(x, w, out, bias, residual, n, k);
         } else {
-            constexpr int kWarps = 4;
-            constexpr int kRpw   = 4;
-            const int blocks     = (n + kWarps * kRpw - 1) / (kWarps * kRpw);
-            bf16_gemv_multirow_kernel<OutT, kWarps, kRpw>
-                <<<blocks, kWarps * 32, 0, stream>>>(x, w, out, bias, residual, n, k);
+            const int blocks = (n + 3) / 4;
+            bf16_gemv_1rpw_pf2_kernel<OutT>
+                <<<blocks, 128, 0, stream>>>(x, w, out, bias, residual, n, k);
         }
         CUDA_CHECK(cudaGetLastError());
         return;
@@ -992,6 +1103,13 @@ void dispatch_bf16_linear(const __nv_bfloat16* x, const __nv_bfloat16* w, OutT* 
         case 7: dispatch_bf16_small_t_fixed<OutT, 7>(x, w, out, bias, residual, n, k, stream); break;
         case 8: dispatch_bf16_small_t_fixed<OutT, 8>(x, w, out, bias, residual, n, k, stream); break;
         }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (t <= 16 && k >= 512) {
+        const int blocks = (n + 7) / 8;
+        bf16_t9_16_16tpr_pf2_kernel<OutT>
+            <<<blocks, 128, 0, stream>>>(x, w, out, bias, residual, n, k, t);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1049,11 +1167,11 @@ template <int ActiveT>
 void launch_unembed_small_t_argmax(const __nv_bfloat16* x, const __nv_bfloat16* w, int valid,
                                    int k, float softcap, ArgmaxScratch& scratch, float* max_vals,
                                    std::int32_t* max_ids, cudaStream_t stream) {
-    constexpr int kWarps  = 4;
-    constexpr int kRpw    = (ActiveT <= 4) ? 2 : 1;
-    const int max_blks    = (valid + kWarps * kRpw - 1) / (kWarps * kRpw);
-    const int num_blocks  = std::min(320, max_blks);
-    unembed_small_t_argmax_kernel<ActiveT, kWarps, kRpw><<<num_blocks, kWarps * 32, 0, stream>>>(
+    constexpr int kTpr   = (ActiveT == 1) ? 32 : 16;
+    constexpr int kRpb   = 128 / kTpr;
+    const int max_blks   = (valid + kRpb - 1) / kRpb;
+    const int num_blocks = std::min(320, max_blks);
+    unembed_small_t_argmax_pf2_kernel<ActiveT, kTpr><<<num_blocks, 128, 0, stream>>>(
         x, w, valid, k, num_blocks, scratch.vals, scratch.ids);
     CUDA_CHECK(cudaGetLastError());
     reduce_block_argmax_kernel<<<ActiveT, 256, 0, stream>>>(
@@ -1162,213 +1280,239 @@ __global__ __launch_bounds__(WarpsPerRow * 32, 2) void bf16_pair_small_t_splitk_
     }
 }
 
-struct Bf16TripleArgs {
-    const __nv_bfloat16* x[3];
-    const __nv_bfloat16* w[3];
-    __nv_bfloat16* out[3];
-    int n[3];
+// Flat scalar argument struct: ZERO array indexing -> ZERO 96-byte local stack frame!
+struct Bf16MultiArgs {
+    const __nv_bfloat16* x0;
+    const __nv_bfloat16* x1;
+    const __nv_bfloat16* x2;
+    const __nv_bfloat16* x3;
+    const __nv_bfloat16* x4;
+    const __nv_bfloat16* w0;
+    const __nv_bfloat16* w1;
+    const __nv_bfloat16* w2;
+    const __nv_bfloat16* w3;
+    const __nv_bfloat16* w4;
+    __nv_bfloat16* out0;
+    __nv_bfloat16* out1;
+    __nv_bfloat16* out2;
+    __nv_bfloat16* out3;
+    __nv_bfloat16* out4;
+    int n0;
+    int n1;
+    int n2;
+    int n3;
+    int n4;
     int b0;
     int b01;
+    int b012;
+    int b0123;
 };
 
-template <int WarpsPerBlock, int RowsPerWarp>
-__global__ __launch_bounds__(WarpsPerBlock * 32, 4) void bf16_triple_gemv_kernel(
-    Bf16TripleArgs args, int k) {
-    int seg = 0;
-    int blk = blockIdx.x;
+template <int NumSegs>
+__device__ __forceinline__ void select_multi_seg(const Bf16MultiArgs& args, int& blk,
+                                                 const __nv_bfloat16*& x,
+                                                 const __nv_bfloat16*& w,
+                                                 __nv_bfloat16*& out, int& n) {
+    if constexpr (NumSegs == 5) {
+        if (blk >= args.b0123) {
+            blk -= args.b0123;
+            x = args.x4; w = args.w4; out = args.out4; n = args.n4;
+            return;
+        }
+        if (blk >= args.b012) {
+            blk -= args.b012;
+            x = args.x3; w = args.w3; out = args.out3; n = args.n3;
+            return;
+        }
+    }
     if (blk >= args.b01) {
-        seg = 2;
         blk -= args.b01;
+        x   = args.x2;
+        w   = args.w2;
+        out = args.out2;
+        n   = args.n2;
     } else if (blk >= args.b0) {
-        seg = 1;
         blk -= args.b0;
-    }
-    const __nv_bfloat16* x = args.x[seg];
-    const __nv_bfloat16* w = args.w[seg];
-    __nv_bfloat16* out     = args.out[seg];
-    const int n            = args.n[seg];
-
-    const int warp = threadIdx.x >> 5;
-    const int lane = threadIdx.x & 31;
-    const int row0 = (blk * WarpsPerBlock + warp) * RowsPerWarp;
-    if (row0 >= n) { return; }
-
-    const int k8             = k >> 3;
-    float acc[RowsPerWarp][4] = {};
-    const bool full_group    = (row0 + RowsPerWarp <= n);
-
-    if (full_group) {
-        for (int i = lane; i < k8; i += 32) {
-            // Issue ALL 4 weight loads + x load BEFORE decode/FMA -> 4x HBM2 MLP!
-            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x) + i);
-            uint4 wv[RowsPerWarp];
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                wv[r] = ld_global_cg_u4(
-                    reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0 + r) * k) + i);
-            }
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float xf[8];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f = __bfloat1622float2(xb[j]);
-                xf[2 * j]      = f.x;
-                xf[2 * j + 1]  = f.y;
-            }
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv[r]);
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 wf = __bfloat1622float2(wb[j]);
-                    acc[r][j]       = fmaf(wf.x, xf[2 * j], fmaf(wf.y, xf[2 * j + 1], acc[r][j]));
-                }
-            }
-        }
+        x   = args.x1;
+        w   = args.w1;
+        out = args.out1;
+        n   = args.n1;
     } else {
-        for (int i = lane; i < k8; i += 32) {
-            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float xf[8];
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f = __bfloat1622float2(xb[j]);
-                xf[2 * j]      = f.x;
-                xf[2 * j + 1]  = f.y;
-            }
-#pragma unroll
-            for (int r = 0; r < RowsPerWarp; ++r) {
-                if (row0 + r < n) {
-                    const uint4 wv = ld_global_cg_u4(
-                        reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0 + r) * k) + i);
-                    const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        const float2 wf = __bfloat1622float2(wb[j]);
-                        acc[r][j]       = fmaf(wf.x, xf[2 * j], fmaf(wf.y, xf[2 * j + 1], acc[r][j]));
-                    }
-                }
-            }
-        }
-    }
-
-#pragma unroll
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const int row = row0 + r;
-        if (row < n) {
-            const float sum = warp_reduce_sum((acc[r][0] + acc[r][1]) + (acc[r][2] + acc[r][3]));
-            if (lane == 0) { out[row] = __float2bfloat16_rn(sum); }
-        }
+        x   = args.x0;
+        w   = args.w0;
+        out = args.out0;
+        n   = args.n0;
     }
 }
 
-template <int ActiveT, int WarpsPerBlock, int RowsPerWarp>
-__global__ __launch_bounds__(WarpsPerBlock * 32, 2) void bf16_triple_small_t_wpr_kernel(
-    Bf16TripleArgs args, int k) {
-    int seg = 0;
+template <int NumSegs>
+__global__ __launch_bounds__(128, 8) void bf16_multi_gemv_1rpw_pf2_kernel(
+    Bf16MultiArgs args, int k) {
     int blk = blockIdx.x;
-    if (blk >= args.b01) {
-        seg = 2;
-        blk -= args.b01;
-    } else if (blk >= args.b0) {
-        seg = 1;
-        blk -= args.b0;
-    }
-    const __nv_bfloat16* x = args.x[seg];
-    const __nv_bfloat16* w = args.w[seg];
-    __nv_bfloat16* out     = args.out[seg];
-    const int n            = args.n[seg];
+    const __nv_bfloat16 *x, *w;
+    __nv_bfloat16* out;
+    int n;
+    select_multi_seg<NumSegs>(args, blk, x, w, out, n);
 
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
-    const int row0 = (blk * WarpsPerBlock + warp) * RowsPerWarp;
-    if (row0 >= n) { return; }
+    const int row  = blk * 4 + warp;
+    if (row >= n) { return; }
 
-    const int k8                   = k >> 3;
-    float acc[RowsPerWarp][ActiveT] = {};
+    const int k8    = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    const uint4* xp = reinterpret_cast<const uint4*>(x);
 
-    for (int i = lane; i < k8; i += 32) {
-        float xf[ActiveT][8];
-#pragma unroll
-        for (int ti = 0; ti < ActiveT; ++ti) {
-            const uint4 xp = __ldg(reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(ti) * k) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xp);
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 f    = __bfloat1622float2(xb[j]);
-                xf[ti][2 * j]     = f.x;
-                xf[ti][2 * j + 1] = f.y;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (lane < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + lane);
+        uint4 x_cur = __ldg(xp + lane);
+        for (int i = lane; i < k8; i += 32) {
+            uint4 w_nxt{}, x_nxt{};
+            if (i + 32 < k8) {
+                w_nxt = ld_global_cg_u4(wp + i + 32);
+                x_nxt = __ldg(xp + i + 32);
             }
-        }
-        uint4 wv[RowsPerWarp];
-#pragma unroll
-        for (int r = 0; r < RowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < n) {
-                wv[r] = ld_global_cg_u4(
-                    reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k) + i);
-            }
-        }
-#pragma unroll
-        for (int r = 0; r < RowsPerWarp; ++r) {
-            const int row = row0 + r;
-            if (row < n) {
-                const auto* wb = reinterpret_cast<const __nv_bfloat162*>(&wv[r]);
-                float wf[8];
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const float2 f = __bfloat1622float2(wb[j]);
-                    wf[2 * j]      = f.x;
-                    wf[2 * j + 1]  = f.y;
-                }
-#pragma unroll
-                for (int ti = 0; ti < ActiveT; ++ti) {
-                    float a0 = 0.0f, a1 = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 4; ++j) {
-                        a0 = fmaf(wf[2 * j], xf[ti][2 * j], a0);
-                        a1 = fmaf(wf[2 * j + 1], xf[ti][2 * j + 1], a1);
-                    }
-                    acc[r][ti] += a0 + a1;
-                }
-            }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&x_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]), x0 = __bfloat1622float2(xb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]), x1 = __bfloat1622float2(xb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]), x2 = __bfloat1622float2(xb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]), x3 = __bfloat1622float2(xb[3]);
+            a0 = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, a0));
+            a1 = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, a1));
+            a2 = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, a2));
+            a3 = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, a3));
+            w_cur = w_nxt;
+            x_cur = x_nxt;
         }
     }
+    const float sum = warp_reduce_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) { out[row] = __float2bfloat16_rn(sum); }
+}
 
-#pragma unroll
-    for (int r = 0; r < RowsPerWarp; ++r) {
-        const int row = row0 + r;
-        if (row < n) {
+template <int NumSegs, int ActiveT>
+__global__ __launch_bounds__(128, 6) void bf16_multi_small_t_16tpr_pf2_kernel(
+    Bf16MultiArgs args, int k) {
+    int blk = blockIdx.x;
+    const __nv_bfloat16 *x, *w;
+    __nv_bfloat16* out;
+    int n;
+    select_multi_seg<NumSegs>(args, blk, x, w, out, n);
+
+    const int r_loc = threadIdx.x >> 4;
+    const int kl    = threadIdx.x & 15;
+    const int row   = blk * 8 + r_loc;
+    if (row >= n) { return; }
+
+    const int k8       = k >> 3;
+    const uint4* wp    = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[ActiveT] = {};
+
+    if (kl < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + kl);
+        for (int i = kl; i < k8; i += 16) {
+            uint4 w_nxt{};
+            if (i + 16 < k8) { w_nxt = ld_global_cg_u4(wp + i + 16); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
 #pragma unroll
             for (int ti = 0; ti < ActiveT; ++ti) {
-                const float sum = warp_reduce_sum(acc[r][ti]);
-                if (lane == 0) {
-                    out[static_cast<std::int64_t>(ti) * n + row] = __float2bfloat16_rn(sum);
-                }
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
             }
+            w_cur = w_nxt;
         }
+    }
+
+#pragma unroll
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        float sum = acc[ti];
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 8, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 4, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1, 16);
+        if (kl == 0) { out[static_cast<std::int64_t>(ti) * n + row] = __float2bfloat16_rn(sum); }
     }
 }
 
-template <int kTiles, int SplitK>
+template <int NumSegs>
+__global__ __launch_bounds__(128, 4) void bf16_multi_t9_16_16tpr_pf2_kernel(
+    Bf16MultiArgs args, int k, int t) {
+    int blk = blockIdx.x;
+    const __nv_bfloat16 *x, *w;
+    __nv_bfloat16* out;
+    int n;
+    select_multi_seg<NumSegs>(args, blk, x, w, out, n);
+
+    const int r_loc = threadIdx.x >> 4;
+    const int kl    = threadIdx.x & 15;
+    const int row   = blk * 8 + r_loc;
+    if (row >= n) { return; }
+
+    const int k8    = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[16]   = {};
+
+    if (kl < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + kl);
+        for (int i = kl; i < k8; i += 16) {
+            uint4 w_nxt{};
+            if (i + 16 < k8) { w_nxt = ld_global_cg_u4(wp + i + 16); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
+            for (int ti = 0; ti < t; ++ti) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
+            }
+            w_cur = w_nxt;
+        }
+    }
+
+    for (int ti = 0; ti < t; ++ti) {
+        float sum = acc[ti];
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 8, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 4, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1, 16);
+        if (kl == 0) { out[static_cast<std::int64_t>(ti) * n + row] = __float2bfloat16_rn(sum); }
+    }
+}
+
+template <int NumSegs, int kTiles, int SplitK>
 __global__ __launch_bounds__(
     SplitK * 32, (kTiles <= 2 ? 16 : 4) / SplitK < 1 ? 1 : (kTiles <= 2 ? 16 : 4) / SplitK)
-void bf16_triple_volta_qpn_ktiles_kernel(Bf16TripleArgs args, int k, int t) {
+void bf16_multi_volta_qpn_ktiles_kernel(Bf16MultiArgs args, int k, int t) {
     __shared__ float partial[SplitK][kTiles * 8 * 32];
-    int seg = 0;
     int blk = blockIdx.x;
-    if (blk >= args.b01) {
-        seg = 2;
-        blk -= args.b01;
-    } else if (blk >= args.b0) {
-        seg = 1;
-        blk -= args.b0;
-    }
-    const __nv_bfloat16* x = args.x[seg];
-    const __nv_bfloat16* w = args.w[seg];
-    __nv_bfloat16* out     = args.out[seg];
-    const int n            = args.n[seg];
+    const __nv_bfloat16 *x, *w;
+    __nv_bfloat16* out;
+    int n;
+    select_multi_seg<NumSegs>(args, blk, x, w, out, n);
 
     const int lane    = threadIdx.x & 31;
     const int warp    = threadIdx.x >> 5;
@@ -1449,18 +1593,58 @@ void bf16_triple_volta_qpn_ktiles_kernel(Bf16TripleArgs args, int k, int t) {
     }
 }
 
-template <int ActiveT>
-void dispatch_bf16_triple_small_t(const Bf16TripleArgs& base_args, int k, cudaStream_t stream) {
-    constexpr int kWarps = 4;
-    constexpr int kRpw   = (ActiveT <= 4) ? 2 : 1;
-    constexpr int kRpc   = kWarps * kRpw;
-    Bf16TripleArgs args  = base_args;
-    args.b0              = (args.n[0] + kRpc - 1) / kRpc;
-    const int b1         = (args.n[1] + kRpc - 1) / kRpc;
-    const int b2         = (args.n[2] + kRpc - 1) / kRpc;
-    args.b01             = args.b0 + b1;
-    bf16_triple_small_t_wpr_kernel<ActiveT, kWarps, kRpw>
-        <<<args.b01 + b2, kWarps * 32, 0, stream>>>(args, k);
+template <int NumSegs>
+void dispatch_bf16_multi(const Bf16MultiArgs& base_args, int k, int t, cudaStream_t stream) {
+    auto set_blocks = [&](Bf16MultiArgs& a, int rows_per_blk) -> int {
+        a.b0         = (a.n0 + rows_per_blk - 1) / rows_per_blk;
+        const int b1 = (a.n1 + rows_per_blk - 1) / rows_per_blk;
+        const int b2 = (a.n2 + rows_per_blk - 1) / rows_per_blk;
+        a.b01        = a.b0 + b1;
+        if constexpr (NumSegs == 3) {
+            return a.b01 + b2;
+        } else {
+            a.b012       = a.b01 + b2;
+            const int b3 = (a.n3 + rows_per_blk - 1) / rows_per_blk;
+            const int b4 = (a.n4 + rows_per_blk - 1) / rows_per_blk;
+            a.b0123      = a.b012 + b3;
+            return a.b0123 + b4;
+        }
+    };
+
+    Bf16MultiArgs args = base_args;
+    if (t == 1) {
+        const int g = set_blocks(args, 4);
+        bf16_multi_gemv_1rpw_pf2_kernel<NumSegs><<<g, 128, 0, stream>>>(args, k);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (t <= 8) {
+        const int g = set_blocks(args, 8);
+        switch (t) {
+        case 2: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 2><<<g, 128, 0, stream>>>(args, k); break;
+        case 3: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 3><<<g, 128, 0, stream>>>(args, k); break;
+        case 4: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 4><<<g, 128, 0, stream>>>(args, k); break;
+        case 5: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 5><<<g, 128, 0, stream>>>(args, k); break;
+        case 6: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 6><<<g, 128, 0, stream>>>(args, k); break;
+        case 7: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 7><<<g, 128, 0, stream>>>(args, k); break;
+        case 8: bf16_multi_small_t_16tpr_pf2_kernel<NumSegs, 8><<<g, 128, 0, stream>>>(args, k); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    if (t <= 16) {
+        const int g = set_blocks(args, 8);
+        bf16_multi_t9_16_16tpr_pf2_kernel<NumSegs><<<g, 128, 0, stream>>>(args, k, t);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    const int g = set_blocks(args, 32);
+    if (t <= 24) {
+        bf16_multi_volta_qpn_ktiles_kernel<NumSegs, 3, 4><<<g, 128, 0, stream>>>(args, k, t);
+    } else {
+        bf16_multi_volta_qpn_ktiles_kernel<NumSegs, 4, 4><<<g, 128, 0, stream>>>(args, k, t);
+    }
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void inkling2_bf16_linear_pair(const Tensor& x0, const Tensor& w0, Tensor& out0,
@@ -1507,64 +1691,68 @@ void inkling2_bf16_linear_triple(const Tensor& x0, const Tensor& w0, Tensor& out
         out0.dtype == DType::BF16 && out1.dtype == DType::BF16 && out2.dtype == DType::BF16 &&
         x1.ne[0] == k && x2.ne[0] == k && x1.ne[1] == t && x2.ne[1] == t &&
         (k % 64 == 0) && t >= 1 && t <= 32) {
-        Bf16TripleArgs args{};
-        args.x[0]   = static_cast<const __nv_bfloat16*>(x0.data);
-        args.x[1]   = static_cast<const __nv_bfloat16*>(x1.data);
-        args.x[2]   = static_cast<const __nv_bfloat16*>(x2.data);
-        args.w[0]   = static_cast<const __nv_bfloat16*>(w0.data);
-        args.w[1]   = static_cast<const __nv_bfloat16*>(w1.data);
-        args.w[2]   = static_cast<const __nv_bfloat16*>(w2.data);
-        args.out[0] = static_cast<__nv_bfloat16*>(out0.data);
-        args.out[1] = static_cast<__nv_bfloat16*>(out1.data);
-        args.out[2] = static_cast<__nv_bfloat16*>(out2.data);
-        args.n[0]   = w0.ne[1];
-        args.n[1]   = w1.ne[1];
-        args.n[2]   = w2.ne[1];
-
-        if (t == 1) {
-            constexpr int kWarps = 4;
-            constexpr int kRpw   = 4;
-            constexpr int kRpc   = kWarps * kRpw;
-            args.b0              = (args.n[0] + kRpc - 1) / kRpc;
-            const int b1         = (args.n[1] + kRpc - 1) / kRpc;
-            const int b2         = (args.n[2] + kRpc - 1) / kRpc;
-            args.b01             = args.b0 + b1;
-            bf16_triple_gemv_kernel<kWarps, kRpw><<<args.b01 + b2, kWarps * 32, 0, stream>>>(args, k);
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        if (t <= 8) {
-            switch (t) {
-            case 2: dispatch_bf16_triple_small_t<2>(args, k, stream); break;
-            case 3: dispatch_bf16_triple_small_t<3>(args, k, stream); break;
-            case 4: dispatch_bf16_triple_small_t<4>(args, k, stream); break;
-            case 5: dispatch_bf16_triple_small_t<5>(args, k, stream); break;
-            case 6: dispatch_bf16_triple_small_t<6>(args, k, stream); break;
-            case 7: dispatch_bf16_triple_small_t<7>(args, k, stream); break;
-            case 8: dispatch_bf16_triple_small_t<8>(args, k, stream); break;
-            }
-            CUDA_CHECK(cudaGetLastError());
-            return;
-        }
-        // T = 9..32: multi-tile Volta QPN Tensor Core in ONE launch!
-        args.b0      = (args.n[0] + 31) / 32;
-        const int b1 = (args.n[1] + 31) / 32;
-        const int b2 = (args.n[2] + 31) / 32;
-        args.b01     = args.b0 + b1;
-        const int g  = args.b01 + b2;
-        if (t <= 16) {
-            bf16_triple_volta_qpn_ktiles_kernel<2, 4><<<g, 128, 0, stream>>>(args, k, t);
-        } else if (t <= 24) {
-            bf16_triple_volta_qpn_ktiles_kernel<3, 4><<<g, 128, 0, stream>>>(args, k, t);
-        } else {
-            bf16_triple_volta_qpn_ktiles_kernel<4, 4><<<g, 128, 0, stream>>>(args, k, t);
-        }
-        CUDA_CHECK(cudaGetLastError());
+        Bf16MultiArgs args{};
+        args.x0   = static_cast<const __nv_bfloat16*>(x0.data);
+        args.x1   = static_cast<const __nv_bfloat16*>(x1.data);
+        args.x2   = static_cast<const __nv_bfloat16*>(x2.data);
+        args.w0   = static_cast<const __nv_bfloat16*>(w0.data);
+        args.w1   = static_cast<const __nv_bfloat16*>(w1.data);
+        args.w2   = static_cast<const __nv_bfloat16*>(w2.data);
+        args.out0 = static_cast<__nv_bfloat16*>(out0.data);
+        args.out1 = static_cast<__nv_bfloat16*>(out1.data);
+        args.out2 = static_cast<__nv_bfloat16*>(out2.data);
+        args.n0   = w0.ne[1];
+        args.n1   = w1.ne[1];
+        args.n2   = w2.ne[1];
+        dispatch_bf16_multi<3>(args, k, t, stream);
         return;
     }
     inkling2_bf16_linear(x0, w0, out0, stream);
     inkling2_bf16_linear(x1, w1, out1, stream);
     inkling2_bf16_linear(x2, w2, out2, stream);
+}
+
+void inkling2_bf16_linear_5way(const Tensor& x0, const Tensor& w0, Tensor& out0,
+                               const Tensor& x1, const Tensor& w1, Tensor& out1,
+                               const Tensor& x2, const Tensor& w2, Tensor& out2,
+                               const Tensor& x3, const Tensor& w3, Tensor& out3,
+                               const Tensor& x4, const Tensor& w4, Tensor& out4,
+                               cudaStream_t stream) {
+    const int k = x0.ne[0];
+    const int t = x0.ne[1];
+    if (x0.dtype == DType::BF16 && x1.dtype == DType::BF16 && x2.dtype == DType::BF16 &&
+        x3.dtype == DType::BF16 && x4.dtype == DType::BF16 &&
+        out0.dtype == DType::BF16 && out1.dtype == DType::BF16 && out2.dtype == DType::BF16 &&
+        out3.dtype == DType::BF16 && out4.dtype == DType::BF16 &&
+        x1.ne[0] == k && x2.ne[0] == k && x3.ne[0] == k && x4.ne[0] == k &&
+        x1.ne[1] == t && x2.ne[1] == t && x3.ne[1] == t && x4.ne[1] == t &&
+        (k % 64 == 0) && t >= 1 && t <= 32) {
+        Bf16MultiArgs args{};
+        args.x0   = static_cast<const __nv_bfloat16*>(x0.data);
+        args.x1   = static_cast<const __nv_bfloat16*>(x1.data);
+        args.x2   = static_cast<const __nv_bfloat16*>(x2.data);
+        args.x3   = static_cast<const __nv_bfloat16*>(x3.data);
+        args.x4   = static_cast<const __nv_bfloat16*>(x4.data);
+        args.w0   = static_cast<const __nv_bfloat16*>(w0.data);
+        args.w1   = static_cast<const __nv_bfloat16*>(w1.data);
+        args.w2   = static_cast<const __nv_bfloat16*>(w2.data);
+        args.w3   = static_cast<const __nv_bfloat16*>(w3.data);
+        args.w4   = static_cast<const __nv_bfloat16*>(w4.data);
+        args.out0 = static_cast<__nv_bfloat16*>(out0.data);
+        args.out1 = static_cast<__nv_bfloat16*>(out1.data);
+        args.out2 = static_cast<__nv_bfloat16*>(out2.data);
+        args.out3 = static_cast<__nv_bfloat16*>(out3.data);
+        args.out4 = static_cast<__nv_bfloat16*>(out4.data);
+        args.n0   = w0.ne[1];
+        args.n1   = w1.ne[1];
+        args.n2   = w2.ne[1];
+        args.n3   = w3.ne[1];
+        args.n4   = w4.ne[1];
+        dispatch_bf16_multi<5>(args, k, t, stream);
+        return;
+    }
+    inkling2_bf16_linear_triple(x0, w0, out0, x1, w1, out1, x2, w2, out2, stream);
+    inkling2_bf16_linear_pair(x3, w3, out3, x4, w4, out4, stream);
 }
 
 void inkling2_unembed_project(const Tensor& x, const Tensor& w, float softcap,
