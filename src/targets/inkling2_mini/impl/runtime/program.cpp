@@ -1374,50 +1374,33 @@ private:
                         v_src_proj = &v_in_t;
                     }
                 } else {
-                    // Pass 1 or 2: Paired Cross-Pass Messages + Pre-Attn AttnRes in ONE launch -> batched Q/K/V loop controllers!
+                    // Pass 1 or 2: Mega-fused Cross-Pass Messages + Pre-Attn AttnRes + Q/K/V Loop Controllers!
+                    // 1 launch at T==1 (72x256 3-bar); full 192/216-CTA parallel QKV path at T>=2.
                     const void* bank_srcs[2] = {rs.bank0.data, rs.bank_out.data};
                     void* msg_outs[4]        = {rs.msgs[0].data, rs.msgs[1].data, rs.msgs[2].data,
                                                 rs.msgs[3].data};
                     Tensor cp_q(static_cast<std::byte*>(rs.cross_pass_4q.data) +
                                     static_cast<std::size_t>(core_idx) * 4 * kHiddenSize * sizeof(float),
                                 DType::FP32, {kHiddenSize, 4});
-                    Tensor msg0      = slice_t(rs.msgs[0], kHiddenSize);
-                    Tensor msg1      = slice_t(rs.msgs[1], kHiddenSize);
-                    Tensor msg2      = slice_t(rs.msgs[2], kHiddenSize);
                     Tensor ctrl_z_3t(rs.ctrl_z.data, DType::BF16, {2 * kHiddenSize, 3 * T});
                     Tensor ctrl_h_3t(rs.ctrl_h.data, DType::BF16, {kGateRank, 3 * T});
                     Tensor ctrl_gf_3t(rs.ctrl_gf.data, DType::BF16, {2 * kHiddenSize, 3 * T});
                     if (is_local) {
-                        void* outs[1] = {rs.mlp_in.data}; // temp unnormed mixed
-                        ops::inkling2_attn_res_mix_pair_and_prep_qkv(
-                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query, outs,
-                            1, ctrl_z_3t, kRmsNormEps, s);
-                        Tensor mixed = slice_t(rs.mlp_in, kHiddenSize);
-                        ops::inkling2_loop_control_qkv(
-                            mixed, mixed, mixed, msg0, msg1, msg2,
-                            lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
+                        void* tmp_cur[1] = {rs.mlp_in.data};
+                        ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query,
+                            tmp_cur, 1, lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
                             lw.ctrl_attn.gain_forget, lw.ctrl_k.gain_forget, lw.ctrl_v.gain_forget,
-                            &lw.attn_norm, &lw.attn_norm, &lw.attn_norm,
-                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, q_in_t, k_in_t, v_in_t, kRmsNormEps, s,
-                            /*skip_prep=*/true, rs.ctrl_done);
+                            lw.attn_norm, lw.attn_norm, lw.attn_norm, ctrl_z_3t, ctrl_h_3t,
+                            ctrl_gf_3t, q_in_t, k_in_t, v_in_t, kRmsNormEps, s, rs.ctrl_done);
                     } else {
-                        void* outs[3] = {rs.q_in.data, rs.k_in.data, rs.v_in.data};
-                        ops::inkling2_attn_res_mix_pair_and_prep_qkv(
-                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query, outs,
-                            3, ctrl_z_3t, kRmsNormEps, s);
-                        Tensor tmp_q = slice_t(rs.mlp_in, kHiddenSize);
-                        Tensor tmp_k = slice_t(rs.attn_out, kHiddenSize);
-                        Tensor tmp_v = slice_t(rs.moe_out, kHiddenSize);
-                        ops::inkling2_loop_control_qkv(
-                            q_in_t, k_in_t, v_in_t, msg0, msg1, msg2,
-                            lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
+                        void* tmp_cur[3] = {rs.mlp_in.data, rs.attn_out.data, rs.moe_out.data};
+                        ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                            bank_srcs, cp_q, msg_outs, srcs, n_srcs, lw.attn_res_attn_query,
+                            tmp_cur, 3, lw.ctrl_attn.down, lw.ctrl_k.down, lw.ctrl_v.down,
                             lw.ctrl_attn.gain_forget, lw.ctrl_k.gain_forget, lw.ctrl_v.gain_forget,
-                            &lw.q_input_norm, &lw.k_input_norm, &lw.v_input_norm,
-                            ctrl_z_3t, ctrl_h_3t, ctrl_gf_3t, tmp_q, tmp_k, tmp_v, kRmsNormEps, s,
-                            /*skip_prep=*/true, rs.ctrl_done);
-                        q_in_t = tmp_q;
-                        k_in_t = tmp_k;
-                        v_in_t = tmp_v;
+                            lw.q_input_norm, lw.k_input_norm, lw.v_input_norm, ctrl_z_3t, ctrl_h_3t,
+                            ctrl_gf_3t, q_in_t, k_in_t, v_in_t, kRmsNormEps, s, rs.ctrl_done);
                     }
                     k_src_proj = &k_in_t;
                     v_src_proj = &v_in_t;
@@ -1629,29 +1612,26 @@ private:
                 }
                 m_srcs[cur_blocks] = rs.ffn_inp.data;
 
+                const std::int32_t prep_mode = fuse_moe_prep ? (lw.is_nvfp4 ? 1 : 2) : 0;
                 if (!has_messages) {
-                    const void* nw[1] = {lw.mlp_norm.data};
-                    void* outs[1]     = {mlp_t.data};
-                    ops::inkling2_attn_res_mix(m_srcs, cur_blocks + 1, lw.attn_res_mlp_query, nw,
-                                               outs, 1, kHiddenSize, T, kRmsNormEps, s);
+                    // Zero-barrier fused Pre-MoE AttnRes + mlp_norm + Router + x_staged (1 launch at T==1!)
+                    ops::inkling2_attn_res_moe_router_fused(
+                        m_srcs, cur_blocks + 1, lw.attn_res_mlp_query, lw.mlp_norm,
+                        lw.router_weight, lw.router_bias, kRouteScale, kRmsNormEps, mlp_t,
+                        rs.moe_sc, s, prep_mode);
                 } else {
+                    // Mega-fused Pre-MoE AttnRes + Prep + Loop Control + mlp_norm + Router + x_staged (1 launch at T==1!)
                     Tensor q_tmp     = slice_t(rs.q_in, kHiddenSize);
                     Tensor msg3      = slice_t(rs.msgs[3], kHiddenSize);
                     Tensor ctrl_z_t  = slice_t(rs.ctrl_z, 2 * kHiddenSize);
                     Tensor ctrl_h_t  = slice_t(rs.ctrl_h, kGateRank);
                     Tensor ctrl_gf_t = slice_t(rs.ctrl_gf, 2 * kHiddenSize);
-                    ops::inkling2_attn_res_mix_and_prep(m_srcs, cur_blocks + 1, lw.attn_res_mlp_query,
-                                                        msg3, q_tmp, ctrl_z_t, kRmsNormEps, s);
-                    ops::inkling2_loop_control(q_tmp, msg3, lw.ctrl_mlp.down,
-                                               lw.ctrl_mlp.gain_forget, &lw.mlp_norm, ctrl_z_t,
-                                               ctrl_h_t, ctrl_gf_t, mlp_t, kRmsNormEps, s,
-                                               /*skip_prep=*/true, rs.ctrl_done);
+                    ops::inkling2_attn_res_loop_ctrl_moe_router_fused(
+                        m_srcs, cur_blocks + 1, lw.attn_res_mlp_query, msg3, lw.ctrl_mlp.down,
+                        lw.ctrl_mlp.gain_forget, lw.mlp_norm, lw.router_weight, lw.router_bias,
+                        kRouteScale, kRmsNormEps, q_tmp, ctrl_z_t, ctrl_h_t, ctrl_gf_t,
+                        rs.ctrl_done, mlp_t, rs.moe_sc, s, prep_mode);
                 }
-
-                // Fused Single-Wave Router (+ x_staged prestage + accum_f32 zeroing for T=2..8!)
-                const std::int32_t prep_mode = fuse_moe_prep ? (lw.is_nvfp4 ? 1 : 2) : 0;
-                ops::inkling2_moe_router_fused(mlp_t, lw.router_weight, lw.router_bias,
-                                               kRouteScale, rs.moe_sc, s, prep_mode);
 
                 // Sparse MoE (NVFP4 layers 0..19, MXFP8 layers 20..23)
                 if (lw.is_nvfp4) {

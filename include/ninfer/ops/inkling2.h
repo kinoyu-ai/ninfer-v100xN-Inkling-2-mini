@@ -115,15 +115,15 @@ void inkling2_attn_res_mix_pair_and_prep_qkv(
 //   out = (1 - tanh(f_raw)) * cur + tanh(g_raw) * msg
 // If post_norm_w != nullptr, fuses plain RMSNorm(out, post_norm_w, eps) directly!
 // skip_prep: true when inkling2_attn_res_mix_and_prep already populated scratch_z.
-// done_counter: optional pre-zeroed I32[1] enabling Last-CTA fused post-RMSNorm (zero extra launch!).
+// done_counter: optional pre-zeroed I32[1] enabling single-launch fused down+up_blend+post_norm (T=1..6).
 void inkling2_loop_control(const Tensor& cur, const Tensor& msg, const Tensor& down_w,
                            const Tensor& gain_forget_w, const Tensor* post_norm_w,
                            Tensor& scratch_z, Tensor& scratch_h, Tensor& scratch_gf,
                            Tensor& out, float eps, cudaStream_t stream,
                            bool skip_prep = false, std::int32_t* done_counter = nullptr);
 
-// Batched 3-controller launch (Q, K, V controllers simultaneously in grid.z=3 -> 192 fewer launches/step!).
-// done_counters: optional pre-zeroed I32[3] enabling Last-CTA fused post-RMSNorm for all 3 controllers!
+// Batched 3-controller launch (Q, K, V controllers simultaneously, full 192/216-CTA 80-SM saturation for T=2..8).
+// done_counters: optional pre-zeroed I32[3] (reserved for future/caller compatibility; T==1 uses Group B).
 void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Tensor& cur2,
                                const Tensor& msg0, const Tensor& msg1, const Tensor& msg2,
                                const Tensor& down0, const Tensor& down1, const Tensor& down2,
@@ -133,6 +133,22 @@ void inkling2_loop_control_qkv(const Tensor& cur0, const Tensor& cur1, const Ten
                                Tensor& out0, Tensor& out1, Tensor& out2,
                                float eps, cudaStream_t stream,
                                bool skip_prep = false, std::int32_t* done_counters = nullptr);
+
+// Mega-fused Pre-Attn Core: Paired Cross-Pass AttnRes (S=2,Q=4) + Pre-Attn AttnRes (S1=1..4,Q1=1/3)
+// + Q/K/V Loop Controllers + Post-RMSNorm in ONE launch at T==1 (with fused fallback for T>=2)!
+// Writes msgs[3] (needed by Pre-MoE) and final normalized out0, out1, out2 (q_in, k_in, v_in).
+// tmp_msg_outs[4] (with tmp_msg_outs[3] == msg3_out) and tmp_cur_outs[num_cur_q] are used by the
+// fallback path (must not alias out0..out2).
+void inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+    const void* const* bank_srcs, const Tensor& cp_q_f32, void* const* tmp_msg_outs,
+    const void* const* cur_srcs, std::int32_t num_cur_srcs, const Tensor& cur_q_f32,
+    void* const* tmp_cur_outs, std::int32_t num_cur_q,
+    const Tensor& down0, const Tensor& down1, const Tensor& down2,
+    const Tensor& gf0, const Tensor& gf1, const Tensor& gf2,
+    const Tensor& norm0, const Tensor& norm1, const Tensor& norm2,
+    Tensor& scratch_z_3t, Tensor& scratch_h_3t, Tensor& scratch_gf_3t,
+    Tensor& out0, Tensor& out1, Tensor& out2,
+    float eps, cudaStream_t stream, std::int32_t* done_counters);
 
 // Fused pass-transition copy: bank0 = src_bank0, bank_out = cur, cur = prelude (1 launch vs 3 D2D!).
 void inkling2_swap_pass_banks(const Tensor& src_bank0, const Tensor& prelude,
@@ -364,6 +380,27 @@ void inkling2_moe_router_fused(const Tensor& x, const Tensor& router_weight,
                                const Tensor& router_bias_f32, float route_scale,
                                Inkling2MoeScratch& scratch, cudaStream_t stream,
                                std::int32_t prep_mode = 0);
+
+// Zero-barrier fused Pre-MoE Non-Core: Block AttnRes (S in [1..5], Q=1) + post-RMSNorm (mlp_norm)
+// + Router GEMV + sigmoid+bias Bitonic Top-8 + optional x_staged in ONE launch at T==1
+// (clean fallback to inkling2_attn_res_mix + inkling2_moe_router_fused for T >= 2).
+void inkling2_attn_res_moe_router_fused(const void* const* source_ptrs, std::int32_t num_sources,
+                                        const Tensor& query_f32, const Tensor& mlp_norm_w,
+                                        const Tensor& router_weight, const Tensor& router_bias_f32,
+                                        float route_scale, float eps, Tensor& mlp_out,
+                                        Inkling2MoeScratch& scratch, cudaStream_t stream,
+                                        std::int32_t prep_mode = 0);
+
+// Mega-fused Pre-MoE Core: Block AttnRes (S in [1..5], Q=1) + Loop Control Prep + Down + UpBlend
+// + Post-RMSNorm (mlp_norm) + Router GEMV + Bitonic Top-8 + optional x_staged in ONE launch at T==1
+// (clean fallback to attn_res_mix_and_prep + fused loop_control + moe_router_fused for T >= 2).
+void inkling2_attn_res_loop_ctrl_moe_router_fused(
+    const void* const* source_ptrs, std::int32_t num_sources, const Tensor& query_f32,
+    const Tensor& msg, const Tensor& down_w, const Tensor& gain_forget_w,
+    const Tensor& mlp_norm_w, const Tensor& router_weight, const Tensor& router_bias_f32,
+    float route_scale, float eps, Tensor& scratch_cur, Tensor& scratch_z, Tensor& scratch_h,
+    Tensor& scratch_gf, std::int32_t* ctrl_done, Tensor& mlp_out, Inkling2MoeScratch& scratch,
+    cudaStream_t stream, std::int32_t prep_mode = 0);
 
 // NVFP4 MoE (layers 0..19): num_slabs = 1 (TP2, inter_local=576) or 2 (TP1, inter_local=1152).
 // w13_codes: U8 [num_slabs, 128, 1152, 1152], w13_scales: FP8_E4M3 [num_slabs, 128, 1152, 144]

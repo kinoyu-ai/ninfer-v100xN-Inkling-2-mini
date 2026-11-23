@@ -77,39 +77,30 @@ Workload: 4 essay prompts (`C=1, 4`, `bench_ninfer.py`), `max_tokens=256`, `temp
 
 | Engine / Mode | Weights | C=1 e2e (tok/s) | C=4 agg (tok/s) | C=8 agg (tok/s) |
 |---|---|---:|---:|---:|
-| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **122.0** *(was 104.8)* | **268.2** *(was 238.0)* | **356.9** |
-| **NInfer Normal (`temp=0.7, top_p=0.95`)** | Native NVFP4 + MXFP8 + BF16 (lossless) | **121.1** | **267.3** | — |
-| **NInfer DSpark-2** (`--spec mtp --draft-tokens 2`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **127.3** *(was 106.9)* | **208.9** *(was 175.4)* | **241.1** |
-| **NInfer DSpark-3** (`--spec mtp --draft-tokens 3`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **122.0** *(117.9 / 126.2; was 102.0)* | **189.9** *(was 166.2)* | — |
-| **NInfer DSpark-7** (`--spec dflash --draft-tokens 7`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **94.5** *(was 75.2)* | **119.4** *(was 104.7)* | — |
+| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **135.8** *(was 122.0 / orig 104.8)* | **272.0** *(was 268.2 / orig 238.0)* | **358.4** *(was 356.9)* |
+| **NInfer Normal (`temp=0.7, top_p=0.95`)** | Native NVFP4 + MXFP8 + BF16 (lossless) | **134.6** *(was 121.1)* | **270.6** *(was 267.3)* | — |
+| **NInfer DSpark-2** (`--spec mtp --draft-tokens 2`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **129.0** *(was 127.3 / orig 106.9)* | **209.6** *(was 208.9 / orig 175.4)* | **238.3** *(was 241.1)* |
+| **NInfer DSpark-3** (`--spec mtp --draft-tokens 3`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **129.0** *(was 122.0 / orig 102.0)* | **191.0** *(was 189.9 / orig 166.2)* | — |
+| **NInfer DSpark-7** (`--spec dflash --draft-tokens 7`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **87.4** *(was 94.5 / orig 75.2)* | **115.6** *(was 119.4 / orig 104.7)* | — |
 | `llama.cpp` Normal | `UD-Q4_K_XL` (requantized GGUF) | 30.7 | 78.3 | — |
 | `llama.cpp` Normal | `UD-Q8_K_XL` (requantized GGUF) | 29.3 | 55.9 | — |
 | `llama.cpp` + DSpark-3 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 29.3 / 19.8 | 47.7 / 28.5 | — |
 | `llama.cpp` + DSpark-7 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 24.2 / 16.3 | 39.3 / 23.8 | — |
 
-- Compared with `llama.cpp UD-Q4_K_XL` Normal: **3.97×** faster at C=1 Normal (`122.0` vs `30.7`, **4.15×** with DSpark-2 at `127.3`) and **3.43×** faster at C=4 (`268.2` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
-- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.16×** faster at C=1 and **4.80×** faster at C=4.
-- Wave 5 versus the Wave 4.5 build (`b6dc2214`) is within the ±3% run-to-run spread of these
-  150 W measurements on short-context essays (for example Normal C=1 `122.1 → 122.0`, DSpark-2
-  C=4 `211.9 → 208.9`). Non-greedy sampling now runs inside CUDA Graphs with a direct BF16
-  unembed, but that measured only `120.3 → 121.1 tok/s` (C=1) and `267.9 → 267.3 tok/s` (C=4):
-  this TP2 decode is GPU-bound, so removing eager launches and the FP32 logit round-trip is not
-  visible end to end.
+- Compared with `llama.cpp UD-Q4_K_XL` Normal: **4.42×** faster at C=1 Normal (`135.8` vs `30.7`) and **3.47×** faster at C=4 (`272.0` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
+- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.63×** faster at C=1 and **4.87×** faster at C=4.
+- **Wave 6 latency-kernel fusion (`f2ac23ba` → current)**: collapsing Pre-Attn Core QKV (Group B: 4→1 launch), Pre-MoE Non-Core AttnRes+Router (Group C: 2→1 launch), and Pre-MoE Core AttnRes+LoopCtrl+Router (Group D: 5→1 launch) plus Split-Q AttnRes and 4-warp Bitonic Top-8 routing cuts C=1 launches from **`681 → 489` / step (`-28.2%`)** and eager CUPTI step wall time from **`8,054.7 → 7,256.2 µs` (`-9.9%`)** (target AttnRes + LoopCtrl + Router kernel time `1,887.8 → 1,224.8 µs/step`, `-35.1%`; inter-kernel gaps `703.9 → 465.0 µs/step`, `-33.9%`). End-to-end Normal C=1 improves **`+11.3%`** (`122.0 → 135.8 tok/s` greedy, `121.1 → 134.6 tok/s` at `temp=0.7`), overtaking DSpark-2/3 on low-acceptance essay prompts, while Normal C=4/C=8 and DSpark-2/3 C=1/C=4 also improve (`+0.4%` to `+5.7%`). On DSpark-7 essays, lower draft acceptance shifts wall `tok/s` (`94.5 → 87.4`); per-round verification latency on code stays within `+1.5%` (`21.47 → 21.80 ms/rnd`).
 
 ### Structured / code generation & 4K–16K long-context DSpark showcase (C=1, greedy, `--no-thinking`)
 
 | Workload | Normal | DSpark-2 | DSpark-3 | DSpark-7 |
 |---|---:|---:|---:|---:|
-| Python dataclass refactor (256 tok, engine decode; Wave 4.5 build) | **128.47 tok/s** *(was 106.08, +21.1%)* | **168.90 tok/s** (`2.19` tok/rnd, 59.6%, `12.97 ms/rnd`) | **166.68 tok/s** (`2.41` tok/rnd, 46.9%, `14.46 ms/rnd`) | **145.32 tok/s** (`3.12` tok/rnd, 30.3%, `21.47 ms/rnd`) |
-| 4,274-tok needle retrieval (`--max-context 8192`; Wave 4.5 build) | **114.24 tok/s** *(was 83.00, +37.6%)* | — | **181.82 tok/s** (`3.10` tok/rnd, *was 139.77, +30.1%*) | — |
-| 16,304-tok long-context decode (`--max-context 20480`, 128 new; Wave 4.5 → Wave 5) | **95.92 → 99.32 tok/s** (single run) | — | **119.10 → 131.78 tok/s**; `20.74 → 20.11 ms/rnd` (−3.0%), acceptance `2.47 → 2.65` tok/rnd | — |
+| Python dataclass refactor (256 tok, engine decode) | **139.79 tok/s** (`7.15 ms/tok`, *was 128.47 / orig 106.08, +31.8%*) | **174.83 tok/s** (`2.26` tok/rnd, 62.8%, `12.93 ms/rnd`, *was 168.90*) | **176.29 tok/s** (`2.55` tok/rnd, 51.7%, `14.46 ms/rnd`, *was 166.68*) | **132.59 tok/s** (`2.89` tok/rnd, 27.0%, `21.80 ms/rnd`, *was 145.32 @ `3.12`*) |
+| 4,274-tok needle retrieval (`--max-context 8192`, 128 new) | **124.83 tok/s** (`8.01 ms/tok`, *was 114.24 / orig 83.00, +50.4%*) | — | **152.57 tok/s** (`2.68` tok/rnd, `17.57 ms/rnd`, *was 181.82 @ `3.10`*) | — |
+| 16,304-tok long-context decode (`--max-context 20480`, 128 new) | **107.23 tok/s** (`9.33 ms/tok`, *was 99.32, +8.0%*) | — | **110.69 tok/s** (`2.25` tok/rnd, `20.33 ms/rnd`, *was 131.78 @ `2.65`*) | — |
 
-- The 16K DSpark-3 gain is mostly a change in draft acceptance (`2.47 → 2.65` tok/rnd), because
-  the single-exp online softmax changes floating-point rounding in global attention; the
-  per-round kernel time improves by about 3%. Both outputs are valid greedy decodes of their own
-  numerics, not bit-identical to each other.
-
-- Per-round decode latency dropped to **`7.78 ms/tok`** (Normal C=1), **`12.97 ms/rnd`** (DSpark-2), and **`14.46 ms/rnd`** (DSpark-3); high-acceptance prompts (`~3.0+ tok/rnd`) reach **182–205+ tok/s** decode while preserving lossless weights and exact greedy semantics.
+- Single-run DSpark `tok/s` on 4K/16K and DSpark-7 reflects run-to-run draft acceptance variance from multi-token `atomicAdd` MoE accumulation (`3.10 → 2.68` at 4K, `2.65 → 2.25` at 16K, `3.12 → 2.89` on Code DSpark-7); per-round kernel latencies remain nearly flat (`17.05 → 17.57`, `20.11 → 20.33`, `21.47 → 21.80 ms/rnd`), while Normal C=1 improves **`+8.0%` to `+9.3%`** across short, 4K, and 16K contexts (`7.15 / 8.01 / 9.33 ms/tok`).
+- Per-round decode latency reaches **`7.15 ms/tok`** (Normal C=1, `139.8 tok/s` greedy / `140.0 tok/s` at `temp=0.7`), **`12.93 ms/rnd`** (DSpark-2), and **`14.46 ms/rnd`** (DSpark-3); structured code reaches **`174.8–176.3 tok/s`** while preserving lossless weights and exact 32/32 PyTorch greedy parity.
 - Cold prefill non-regression spot-check (`512` and `~4,096` tok, C=1): TTFT `0.525 s / 4.679 s` (Normal) and `0.531 s / 4.673 s` (DSpark-3), matching or slightly improving on the full sweep below.
 
 ### Cold prefill throughput & TTFT (512–65,536 tokens, C=1)
@@ -148,12 +139,16 @@ server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–6
   eliminating FP32 logit HBM round-trips, 1-CTA softcap scan, and `cast_fp32_to_bf16`) captured inside
   cross-device `decode_logits_graphs_` for non-greedy sampling, multi-CTA `softcap_mask_f32_kernel`,
   and 4-row/warp strided Markov logits argmax.
-- **Zero-spill coalesced sparse MoE (`src/ops/inkling2/sparse_moe.cu`)**: single-wave 64-CTA
-  Last-CTA fused router (`moe_router_fused` with register-only `warp_select_top8_128`, free
-  Warps 1–3 `T=1` `x_staged` conversion overlapped with Warp 0 top-8 selection, and `T=2..8`
-  input staging + `accum_f32` zeroing), 2-deep prefetched `PreStaged` `T=1` NVFP4/MXFP8 kernels,
-  SMEM-staged `TileM=4` grouped `w13` (`18 KB` SMEM, specialized `mc=1/2/3..4`, 2-deep prefetch), and
-  128-row/CTA grouped `w2` (`0 B` stack/spills verified via `ptxas -v` on every hot kernel).
+- **Zero-spill coalesced sparse MoE (`src/ops/inkling2/sparse_moe.cu`)**: single-wave 64-CTA×288t
+  Last-CTA fused routers (`moe_router_t1_bitonic_288t_kernel` with parallel sigmoid+bias and
+  4-warp branchless Bitonic Top-8 at `T=1`, `288t` zero-loop parallel-warp router for `T=2..8`),
+  zero-barrier Pre-MoE Non-Core mega-fusion (`attn_res_moe_router_t1_kernel`, collapsing AttnRes +
+  `mlp_norm` + `x_staged` + Router + Bitonic Top-8 into 1 launch at `T=1`), 2-barrier 64-CTA
+  Pre-MoE Core mega-fusion (`attn_res_loop_ctrl_moe_router_t1_kernel`, collapsing 5 launches into
+  1 at `T=1` using single-word Volta GPU-scope release-acquire grid barriers), 2-deep prefetched
+  `PreStaged` `T=1` NVFP4/MXFP8 kernels, SMEM-staged `TileM=4` grouped `w13` (`18 KB` SMEM,
+  specialized `mc=1/2/3..4`, 2-deep prefetch), and 128-row/CTA grouped `w2` (`0 B` stack/spills
+  verified via `ptxas -v` on every hot kernel).
 - **Fused TP2 packet-push AllReduce + ShortConv (`src/ops/inkling2/sconv.cu`)**: fuses TP2 direct
   P2P two-epoch packet reduction, optional FP32→BF16 cast from MoE `accum_f32`, `attn_sconv` /
   `mlp_sconv`, and residual/block update into a single kernel for **both** Decode (`T=1..8`) and
@@ -163,19 +158,24 @@ server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–6
   single-launch adaptive Last-CTA Q-head Split-KV for both main attention and DSpark block attention
   (zero reduce launches, zero scratch at short context, cached global page lookups, and a
   warp-uniform single-exp online softmax for `T>=2` global attention once a split holds at least
-  160 keys), K/V SConv
-  fused directly into `attn_prologue`, fused AttnRes + loop-control prep (`attn_res_mix_and_prep`,
-  `attn_res_mix_pair_and_prep_qkv`, `swap_pass_banks`), batched 3-layer MTP context mix/KV-write,
-  fused MTP final-norm/extract/zero, and zero-HBM-intermediate ping-pong `mtp_markov_rnn_step`.
+  160 keys), K/V SConv fused directly into `attn_prologue`, 1-pass Split-Q AttnRes
+  (`inkling2_attn_res_mix_h2304_splitq3_kernel`), 3-barrier 72-CTA Pre-Attn Core QKV mega-fusion
+  (`attn_res_pair_loop_ctrl_qkv_72cta_kernel`, collapsing 4 launches into 1 at `T=1` while
+  retaining full 192/216-CTA parallelism at `T>=2`), single-launch 72-CTA fused single loop
+  control (`loop_control_fused_single_t_kernel` for `T=1..6`), `swap_pass_banks`, batched 3-layer
+  MTP context mix/KV-write, fused MTP final-norm/extract/zero, and zero-HBM-intermediate ping-pong
+  `mtp_markov_rnn_step`.
 
 ## Verification and limitations
 
-- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **172/172 PASS** against
+- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **307/307 PASS** against
   independent FP64 oracles, bit-exact direct-BF16 unembed & `T=1` PreStaged MoE checks, TP1/TP2
   shard-equivalence, two-epoch packet loopback, long-context adaptive Split-KV (`1,100–1,200`
-  tokens across SWA ring wrap & permuted global pages, plus `4,096` / `4,100`-token global cases
-  that exercise the single-exp online softmax route), and fused vs unfused parity checks, with
-  **0 B stack / 0 spills** across all hot Volta kernels.
+  tokens across SWA ring wrap & permuted global pages, plus `4,096` / `4,100`-token global cases),
+  Bitonic Top-8 tie-break checks, fused Group B/C/D & Split-Q AttnRes parity checks, and
+  16-iteration CUDA Graph replay checks (including alternating 72-CTA Group B and 64-CTA Group D
+  on the shared `ctrl_done` sense-reversing barrier word), with **0 B stack / 0 spills** across
+  all hot Volta kernels.
 - **Exact token parity vs PyTorch (`tools/reference/inkling2_mini/reference.py`)**: **32/32 exact
   token match** across `TP2 Graph Normal`, `TP2 Eager Normal`, `TP2 Graph DSpark-2`,
   `TP2 Graph DSpark-3`, `TP2 Graph DSpark-5`, `TP2 Graph DSpark-7`, and the Graph-captured Direct

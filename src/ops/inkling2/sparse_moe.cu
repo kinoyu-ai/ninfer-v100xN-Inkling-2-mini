@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -57,6 +58,106 @@ __device__ __forceinline__ float4 ld_cg_f4_volatile(const void* ptr) {
                  : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
                  : "l"(ptr));
     return val;
+}
+
+__device__ __forceinline__ float4 ld_cg_f4(const void* ptr) {
+    float4 val;
+    asm("ld.global.cg.v4.f32 {%0, %1, %2, %3}, [%4];\n"
+        : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+        : "l"(ptr));
+    return val;
+}
+
+__device__ __forceinline__ float ld_cg_f32(const float* ptr) {
+    float val;
+    asm("ld.global.cg.f32 %0, [%1];\n" : "=f"(val) : "l"(ptr));
+    return val;
+}
+
+__device__ __forceinline__ std::uint16_t ld_cg_u16(const void* ptr) {
+    std::uint16_t val;
+    asm("ld.global.cg.u16 %0, [%1];\n" : "=h"(val) : "l"(ptr));
+    return val;
+}
+
+__device__ __forceinline__ void st_cg_f32(float* ptr, float v) {
+    asm volatile("st.global.cg.f32 [%0], %1;\n" :: "l"(ptr), "f"(v) : "memory");
+}
+
+__device__ __forceinline__ void st_cg_u16(void* ptr, std::uint16_t v) {
+    asm volatile("st.global.cg.u16 [%0], %1;\n" :: "l"(ptr), "h"(v) : "memory");
+}
+
+__device__ __forceinline__ void st_cg_u4(void* ptr, uint4 v) {
+    asm volatile("st.global.cg.v4.u32 [%0], {%1, %2, %3, %4};\n"
+                 :: "l"(ptr), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w)
+                 : "memory");
+}
+
+__device__ __forceinline__ void load_bf16x8(const __nv_bfloat16* p, float (&out)[8]) {
+    const uint4 raw = __ldg(reinterpret_cast<const uint4*>(p));
+    const auto* b   = reinterpret_cast<const __nv_bfloat162*>(&raw);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f = __bfloat1622float2(b[j]);
+        out[2 * j]     = f.x;
+        out[2 * j + 1] = f.y;
+    }
+}
+
+__device__ __forceinline__ uint4 pack_bf16x8(const float (&v)[8]) {
+    uint4 out;
+    auto* dst = reinterpret_cast<__nv_bfloat162*>(&out);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) { dst[j] = __floats2bfloat162_rn(v[2 * j], v[2 * j + 1]); }
+    return out;
+}
+
+__device__ __forceinline__ void grid_barrier_64(unsigned int* bar_word) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int delta = (blockIdx.x == 0) ? (0x80000001u - 64u) : 1u;
+        unsigned int old, cur;
+        asm volatile("atom.add.release.gpu.u32 %0, [%1], %2;\n"
+                     : "=r"(old)
+                     : "l"(bar_word), "r"(delta)
+                     : "memory");
+        do {
+            asm volatile("ld.acquire.gpu.u32 %0, [%1];\n" : "=r"(cur) : "l"(bar_word) : "memory");
+        } while (((cur ^ old) & 0x80000000u) == 0u);
+    }
+    __syncthreads();
+    asm volatile("" ::: "memory");
+}
+
+__device__ __forceinline__ float warp_reduce_64_f4(const float* __restrict__ arr64, int lane) {
+    float v = 0.0f;
+    if (lane < 16) {
+        const float4 f = ld_cg_f4(arr64 + lane * 4);
+        v              = (f.x + f.y) + (f.z + f.w);
+    }
+    v += __shfl_down_sync(0xFFFFFFFFu, v, 8);
+    v += __shfl_down_sync(0xFFFFFFFFu, v, 4);
+    v += __shfl_down_sync(0xFFFFFFFFu, v, 2);
+    v += __shfl_down_sync(0xFFFFFFFFu, v, 1);
+    return v;
+}
+
+int get_moe_device_sm_count() {
+    int dev = 0;
+    CUDA_CHECK(cudaGetDevice(&dev));
+    static std::atomic<int> s_sm[16]{};
+    if (dev >= 0 && dev < 16) {
+        const int cached = s_sm[dev].load(std::memory_order_relaxed);
+        if (cached > 0) { return cached; }
+        int sms = 0;
+        CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+        s_sm[dev].store(sms, std::memory_order_relaxed);
+        return sms;
+    }
+    int sms = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    return sms;
 }
 
 __device__ __forceinline__ float softcapped_swiglu(float g, float u, float gate_cap, float up_cap) {
@@ -317,11 +418,186 @@ __global__ void moe_route_and_group_small_kernel(
     }
 }
 
-// Fused Single-Wave 64-CTA Router GEMV (2 rows/CTA -> fits in 1 wave on 80 SMs!) +
+// ============================================================================
+// 1b. 4-Warp (128t) Branchless Bitonic Top-8 of 128 Precomputed (score, raw)
+//     Replaces 8-pass serial warp_argmax (cuts T==1 router tail by ~2 us/layer!)
+// ============================================================================
+
+__device__ __forceinline__ bool better_expert(float sa, int ia, float sb, int ib) {
+    return (sa > sb) || (sa == sb && ia < ib);
+}
+
+__device__ __forceinline__ void cmp_exch_expert(float& s, int& id, int mask, bool want_better) {
+    const float os        = __shfl_xor_sync(0xFFFFFFFFu, s, mask);
+    const int oid         = __shfl_xor_sync(0xFFFFFFFFu, id, mask);
+    const bool take_other = want_better ? better_expert(os, oid, s, id) : better_expert(s, id, os, oid);
+    if (take_other) {
+        s  = os;
+        id = oid;
+    }
+}
+
+__device__ __forceinline__ void bitonic_sort_8(float& s, int& id, bool desc) {
+    const int lane = threadIdx.x & 31;
+    const bool d2  = ((lane & 2) == 0) ? desc : !desc;
+    cmp_exch_expert(s, id, 1, ((lane & 1) == 0) ? d2 : !d2);
+    const bool d4 = ((lane & 4) == 0) ? desc : !desc;
+    cmp_exch_expert(s, id, 2, ((lane & 2) == 0) ? d4 : !d4);
+    cmp_exch_expert(s, id, 1, ((lane & 1) == 0) ? d4 : !d4);
+    cmp_exch_expert(s, id, 4, ((lane & 4) == 0) ? desc : !desc);
+    cmp_exch_expert(s, id, 2, ((lane & 2) == 0) ? desc : !desc);
+    cmp_exch_expert(s, id, 1, ((lane & 1) == 0) ? desc : !desc);
+}
+
+__device__ __forceinline__ void bitonic_merge_8(float& s, int& id, bool desc) {
+    const int lane = threadIdx.x & 31;
+    cmp_exch_expert(s, id, 4, ((lane & 4) == 0) ? desc : !desc);
+    cmp_exch_expert(s, id, 2, ((lane & 2) == 0) ? desc : !desc);
+    cmp_exch_expert(s, id, 1, ((lane & 1) == 0) ? desc : !desc);
+}
+
+__device__ __forceinline__ void warp_bitonic_top8_of_32(float& s, int& id) {
+    const int lane = threadIdx.x & 31;
+    bitonic_sort_8(s, id, (lane & 8) == 0);
+    cmp_exch_expert(s, id, 8, (lane & 8) == 0);
+    bitonic_merge_8(s, id, (lane & 16) == 0);
+    cmp_exch_expert(s, id, 16, (lane & 16) == 0);
+    bitonic_merge_8(s, id, true);
+}
+
+// 4-warp (128 threads = 1 expert/thread) exact Top-8 of 128 precomputed (scores, raws).
+// Caller MUST call with all threads in the CTA reaching __syncthreads()!
+__device__ __forceinline__ void block_bitonic_top8_128(
+    const float* __restrict__ scores, const float* __restrict__ raws, float route_scale,
+    float* s_cand_s, int* s_cand_id, std::int32_t* __restrict__ out_ids,
+    float* __restrict__ out_weights) {
+    const int tid  = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    if (tid < 128) {
+        float s = ld_cg_f32(scores + tid);
+        int id  = tid;
+        warp_bitonic_top8_of_32(s, id);
+        if (lane < 8) {
+            const int dst  = warp * 8 + ((warp & 1) ? (7 - lane) : lane);
+            s_cand_s[dst]  = s;
+            s_cand_id[dst] = id;
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        float s = s_cand_s[lane];
+        int id  = s_cand_id[lane];
+        cmp_exch_expert(s, id, 8, (lane & 8) == 0);
+        bitonic_merge_8(s, id, (lane & 16) == 0);
+        cmp_exch_expert(s, id, 16, (lane & 16) == 0);
+        bitonic_merge_8(s, id, true);
+
+        const float rw = (lane < 8) ? ld_cg_f32(raws + id) : 0.0f;
+        float wsum     = rw;
+        wsum += __shfl_xor_sync(0xFFFFFFFFu, wsum, 1, 8);
+        wsum += __shfl_xor_sync(0xFFFFFFFFu, wsum, 2, 8);
+        wsum += __shfl_xor_sync(0xFFFFFFFFu, wsum, 4, 8);
+        if (lane < 8) {
+            out_ids[lane]     = id;
+            out_weights[lane] = rw * (route_scale / (wsum + 1e-20f));
+        }
+    }
+}
+
+// T == 1 Ultra-Fast Bitonic Router (64 CTAs x 288t = 1 uint4/thread ZERO loop,
+// precomputed sigmoid+bias across 64 SMs, single tid==0 fence, 4-warp Bitonic Top-8!)
+template <int PrepMode>
+__global__ __launch_bounds__(288, 2) void moe_router_t1_bitonic_288t_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    const float* __restrict__ bias, float route_scale, float* __restrict__ router_logits,
+    float* __restrict__ scores_buf, float* __restrict__ raws_buf,
+    std::int32_t* __restrict__ topk_ids, float* __restrict__ topk_weights,
+    std::int32_t* __restrict__ done_counter, half* __restrict__ x_staged) {
+    __shared__ float smem[2][9];
+    __shared__ float s_cs[32];
+    __shared__ int s_cid[32];
+    __shared__ int s_is_last;
+
+    const int row0  = blockIdx.x * 2;
+    const int tid   = threadIdx.x; // 0..287
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
+    const uint4* w0 = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0) * kHidden);
+    const uint4* w1 = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row0 + 1) * kHidden);
+    const uint4 wv0 = ld_cg_u4(w0 + tid);
+    const uint4 wv1 = ld_cg_u4(w1 + tid);
+    const uint4 xv  = __ldg(reinterpret_cast<const uint4*>(x) + tid);
+
+    float b0 = 0.0f, b1 = 0.0f;
+    if (tid == 0) {
+        b0 = __ldg(bias + row0);
+        b1 = __ldg(bias + row0 + 1);
+    }
+
+    const auto* wb0 = reinterpret_cast<const __nv_bfloat162*>(&wv0);
+    const auto* wb1 = reinterpret_cast<const __nv_bfloat162*>(&wv1);
+    const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f0 = __bfloat1622float2(wb0[j]);
+        const float2 f1 = __bfloat1622float2(wb1[j]);
+        const float2 xf = __bfloat1622float2(xb[j]);
+        a0              = fmaf(f0.x, xf.x, fmaf(f0.y, xf.y, a0));
+        a1              = fmaf(f1.x, xf.x, fmaf(f1.y, xf.y, a1));
+    }
+
+    if constexpr (PrepMode != 0) {
+        if (blockIdx.x == 0) {
+            alignas(16) half2 h[4];
+            if constexpr (PrepMode == 1) {
+                bf16x8_to_staged_h2(xv, h);
+            } else {
+                bf16x8_to_h2(xv, h);
+            }
+            reinterpret_cast<uint4*>(x_staged)[tid] = *reinterpret_cast<const uint4*>(h);
+        }
+    }
+
+    const float ws0 = warp_sum(a0);
+    const float ws1 = warp_sum(a1);
+    if (lane == 0) {
+        smem[0][warp] = ws0;
+        smem[1][warp] = ws1;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float s0 = (((smem[0][0] + smem[0][1]) + (smem[0][2] + smem[0][3])) +
+                          ((smem[0][4] + smem[0][5]) + (smem[0][6] + smem[0][7]))) +
+                         smem[0][8];
+        const float s1 = (((smem[1][0] + smem[1][1]) + (smem[1][2] + smem[1][3])) +
+                          ((smem[1][4] + smem[1][5]) + (smem[1][6] + smem[1][7]))) +
+                         smem[1][8];
+        router_logits[row0 + 0] = s0;
+        router_logits[row0 + 1] = s1;
+        const float r0          = 1.0f / (1.0f + expf(-s0));
+        const float r1          = 1.0f / (1.0f + expf(-s1));
+        st_cg_f32(&raws_buf[row0 + 0], r0);
+        st_cg_f32(&raws_buf[row0 + 1], r1);
+        st_cg_f32(&scores_buf[row0 + 0], r0 + b0);
+        st_cg_f32(&scores_buf[row0 + 1], r1 + b1);
+        __threadfence();
+        s_is_last = (atomicAdd(done_counter, 1) == 63) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_is_last) { return; }
+    if (tid == 0) { done_counter[0] = 0; }
+    asm volatile("" ::: "memory");
+    block_bitonic_top8_128(scores_buf, raws_buf, route_scale, s_cs, s_cid, topk_ids, topk_weights);
+}
+
+// Fused Single-Wave 64-CTA x 288t Router GEMV (1 uint4/thread ZERO loop!) +
 // Sigmoid + Bias Top-8 + Bitmask Single-Pass Grouping + Optional Fused x_staged & accum_f32 Zero!
 // PrepMode: 0 = router only; 1 = also prestage x (NVFP4 staged) + zero accum_f32; 2 = MXFP8 + zero!
 template <int ActiveT, int PrepMode>
-__global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
+__global__ __launch_bounds__(288, 2) void moe_router_fused_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
     const float* __restrict__ bias, float route_scale, float* __restrict__ router_logits,
     std::int32_t* __restrict__ topk_ids, float* __restrict__ topk_weights,
@@ -329,18 +605,18 @@ __global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
     std::int32_t* __restrict__ sorted_pairs, std::int32_t* __restrict__ active_experts,
     std::int32_t* __restrict__ num_active, std::int32_t* __restrict__ done_counter,
     half* __restrict__ x_staged, float* __restrict__ accum_f32) {
-    constexpr int kWarps = 4;
+    constexpr int kWarps = 9;
     __shared__ float smem[2][ActiveT][kWarps];
     __shared__ int s_is_last;
 
     const int row0 = blockIdx.x * 2; // 0, 2, ..., 126
-    const int tid  = threadIdx.x;    // 0..127
-    const int warp = tid >> 5;       // 0..3
+    const int tid  = threadIdx.x;    // 0..287
+    const int warp = tid >> 5;       // 0..8
     const int lane = tid & 31;
 
-    // Piggyback x_staged prestage & accum_f32 zeroing across all 64*128 = 8192 threads (0 extra launches!)
+    // Piggyback x_staged prestage & accum_f32 zeroing across all 64*288 = 18432 threads!
     if constexpr (PrepMode != 0 && ActiveT >= 2) {
-        const int g_tid = blockIdx.x * 128 + tid;
+        const int g_tid = blockIdx.x * 288 + tid;
         if (g_tid < ActiveT * (kHidden / 8)) {
             const uint4 raw = __ldg(reinterpret_cast<const uint4*>(x) + g_tid);
             alignas(16) half2 h[4];
@@ -358,43 +634,39 @@ __global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
 
     const __nv_bfloat16* wrow0 = w + static_cast<std::int64_t>(row0) * kHidden;
     const __nv_bfloat16* wrow1 = wrow0 + kHidden;
-    constexpr int kK8          = kHidden / 8; // 288
-    float acc0[ActiveT]        = {};
-    float acc1[ActiveT]        = {};
+    const uint4 wv0            = ld_cg_u4(reinterpret_cast<const uint4*>(wrow0) + tid);
+    const uint4 wv1            = ld_cg_u4(reinterpret_cast<const uint4*>(wrow1) + tid);
+    const auto* wb0            = reinterpret_cast<const __nv_bfloat162*>(&wv0);
+    const auto* wb1            = reinterpret_cast<const __nv_bfloat162*>(&wv1);
+    float wf0[8], wf1[8];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f0 = __bfloat1622float2(wb0[j]);
+        const float2 f1 = __bfloat1622float2(wb1[j]);
+        wf0[2 * j]      = f0.x;
+        wf0[2 * j + 1]  = f0.y;
+        wf1[2 * j]      = f1.x;
+        wf1[2 * j + 1]  = f1.y;
+    }
 
-    for (int i = tid; i < kK8; i += 128) {
-        // Issue BOTH weight rows in parallel -> 2x HBM2 MLP & 2x x reuse!
-        const uint4 wv0 = ld_cg_u4(reinterpret_cast<const uint4*>(wrow0) + i);
-        const uint4 wv1 = ld_cg_u4(reinterpret_cast<const uint4*>(wrow1) + i);
-        const auto* wb0 = reinterpret_cast<const __nv_bfloat162*>(&wv0);
-        const auto* wb1 = reinterpret_cast<const __nv_bfloat162*>(&wv1);
-        float wf0[8], wf1[8];
+    float acc0[ActiveT] = {};
+    float acc1[ActiveT] = {};
+#pragma unroll
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                                   x + static_cast<std::int64_t>(ti) * kHidden) + tid);
+        const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
+        float a00 = 0.0f, a01 = 0.0f, a10 = 0.0f, a11 = 0.0f;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-            const float2 f0 = __bfloat1622float2(wb0[j]);
-            const float2 f1 = __bfloat1622float2(wb1[j]);
-            wf0[2 * j]      = f0.x;
-            wf0[2 * j + 1]  = f0.y;
-            wf1[2 * j]      = f1.x;
-            wf1[2 * j + 1]  = f1.y;
+            const float2 xf = __bfloat1622float2(xb[j]);
+            a00             = fmaf(wf0[2 * j], xf.x, a00);
+            a01             = fmaf(wf0[2 * j + 1], xf.y, a01);
+            a10             = fmaf(wf1[2 * j], xf.x, a10);
+            a11             = fmaf(wf1[2 * j + 1], xf.y, a11);
         }
-#pragma unroll
-        for (int ti = 0; ti < ActiveT; ++ti) {
-            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
-                x + static_cast<std::int64_t>(ti) * kHidden) + i);
-            const auto* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-            float a00 = 0.0f, a01 = 0.0f, a10 = 0.0f, a11 = 0.0f;
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const float2 xf = __bfloat1622float2(xb[j]);
-                a00             = fmaf(wf0[2 * j], xf.x, a00);
-                a01             = fmaf(wf0[2 * j + 1], xf.y, a01);
-                a10             = fmaf(wf1[2 * j], xf.x, a10);
-                a11             = fmaf(wf1[2 * j + 1], xf.y, a11);
-            }
-            acc0[ti] += a00 + a01;
-            acc1[ti] += a10 + a11;
-        }
+        acc0[ti] = a00 + a01;
+        acc1[ti] = a10 + a11;
     }
 
 #pragma unroll
@@ -408,32 +680,36 @@ __global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
     }
     __syncthreads();
 
-    if (warp == 0 && lane < ActiveT) {
-        const float s0 = (smem[0][lane][0] + smem[0][lane][1]) + (smem[0][lane][2] + smem[0][lane][3]);
-        const float s1 = (smem[1][lane][0] + smem[1][lane][1]) + (smem[1][lane][2] + smem[1][lane][3]);
-        const std::int64_t base = static_cast<std::int64_t>(lane) * kNumExperts + row0;
-        router_logits[base + 0] = s0;
-        router_logits[base + 1] = s1;
+    // Only tid==0 writes all ActiveT pairs (<= 16 floats) -> single-thread __threadfence()!
+    if (tid == 0) {
+#pragma unroll
+        for (int ti = 0; ti < ActiveT; ++ti) {
+            const float s0 = (((smem[0][ti][0] + smem[0][ti][1]) + (smem[0][ti][2] + smem[0][ti][3])) +
+                              ((smem[0][ti][4] + smem[0][ti][5]) + (smem[0][ti][6] + smem[0][ti][7]))) +
+                             smem[0][ti][8];
+            const float s1 = (((smem[1][ti][0] + smem[1][ti][1]) + (smem[1][ti][2] + smem[1][ti][3])) +
+                              ((smem[1][ti][4] + smem[1][ti][5]) + (smem[1][ti][6] + smem[1][ti][7]))) +
+                             smem[1][ti][8];
+            const std::int64_t base = static_cast<std::int64_t>(ti) * kNumExperts + row0;
+            st_cg_f32(&router_logits[base + 0], s0);
+            st_cg_f32(&router_logits[base + 1], s1);
+        }
+        __threadfence();
+        s_is_last = (atomicAdd(done_counter, 1) == 63) ? 1 : 0;
     }
-    __threadfence();
-    __syncthreads();
-
-    if (tid == 0) { s_is_last = (atomicAdd(done_counter, 1) == 63) ? 1 : 0; }
     __syncthreads();
     if (!s_is_last) { return; }
 
     if (tid == 0) { done_counter[0] = 0; }
+    asm volatile("" ::: "memory");
 
     if constexpr (ActiveT == 1) {
         if (warp == 0) {
             warp_select_top8_128(router_logits, bias, route_scale, topk_ids, topk_weights, nullptr);
         } else if constexpr (PrepMode != 0) {
-            // Warps 1..3 (96 threads) are idle during Warp-0 top-8 selection:
-            // stage x[2304] -> x_staged (288 uint4 / 96 = 3 exact coalesced iters!) for free!
-            const int wtid = tid - 32; // 0..95
-#pragma unroll
-            for (int it = 0; it < 3; ++it) {
-                const int idx   = wtid + it * 96; // 0..287
+            // Warps 1..8 (256 threads) stage x[2304] -> x_staged
+            const int wtid = tid - 32;
+            for (int idx = wtid; idx < kHidden / 8; idx += 256) {
                 const uint4 raw = __ldg(reinterpret_cast<const uint4*>(x) + idx);
                 alignas(16) half2 h[4];
                 if constexpr (PrepMode == 1) {
@@ -449,65 +725,520 @@ __global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
         __shared__ int s_ids[ActiveT * kTopK];
         __shared__ int s_wsum[4];
         __shared__ int s_wact[4];
-        for (int t = warp; t < ActiveT; t += kWarps) {
-            warp_select_top8_128(router_logits + static_cast<std::int64_t>(t) * kNumExperts, bias,
-                                 route_scale, topk_ids + t * kTopK, topk_weights + t * kTopK,
-                                 s_ids + t * kTopK);
+        // All ActiveT <= 8 tokens select Top-8 IN PARALLEL across warps 0..ActiveT-1!
+        if (warp < ActiveT) {
+            warp_select_top8_128(router_logits + static_cast<std::int64_t>(warp) * kNumExperts, bias,
+                                 route_scale, topk_ids + warp * kTopK, topk_weights + warp * kTopK,
+                                 s_ids + warp * kTopK);
         }
         __syncthreads();
 
-        // All 128 threads (e = 0..127): single-pass 64-bit bitmask histogram + prefix sum + sparse scatter!
-        const int e         = tid;
-        constexpr int total = ActiveT * kTopK;
         unsigned long long mask = 0ULL;
+        int cnt                 = 0;
+        int off_inc             = 0;
+        int act_inc             = 0;
+        if (tid < 128) {
+            const int e         = tid;
+            constexpr int total = ActiveT * kTopK;
 #pragma unroll
-        for (int i = 0; i < total; ++i) {
-            if (s_ids[i] == e) { mask |= (1ULL << i); }
-        }
-        const int cnt    = __popcll(mask);
-        expert_counts[e] = cnt;
-
-        int off_inc = cnt;
-        int act_inc = (cnt > 0) ? 1 : 0;
-#pragma unroll
-        for (int d = 1; d < 32; d <<= 1) {
-            const int o = __shfl_up_sync(0xFFFFFFFFu, off_inc, d);
-            const int a = __shfl_up_sync(0xFFFFFFFFu, act_inc, d);
-            if (lane >= d) {
-                off_inc += o;
-                act_inc += a;
+            for (int i = 0; i < total; ++i) {
+                if (s_ids[i] == e) { mask |= (1ULL << i); }
             }
-        }
-        if (lane == 31) {
-            s_wsum[warp] = off_inc;
-            s_wact[warp] = act_inc;
+            cnt              = __popcll(mask);
+            expert_counts[e] = cnt;
+            off_inc          = cnt;
+            act_inc          = (cnt > 0) ? 1 : 0;
+#pragma unroll
+            for (int d = 1; d < 32; d <<= 1) {
+                const int o = __shfl_up_sync(0xFFFFFFFFu, off_inc, d);
+                const int a = __shfl_up_sync(0xFFFFFFFFu, act_inc, d);
+                if (lane >= d) {
+                    off_inc += o;
+                    act_inc += a;
+                }
+            }
+            if (lane == 31) {
+                s_wsum[warp] = off_inc;
+                s_wact[warp] = act_inc;
+            }
         }
         __syncthreads();
 
-        int warp_off_base = 0;
-        int warp_act_base = 0;
+        if (tid < 128) {
+            const int e       = tid;
+            int warp_off_base = 0;
+            int warp_act_base = 0;
 #pragma unroll
-        for (int w = 0; w < 4; ++w) {
-            if (w < warp) {
-                warp_off_base += s_wsum[w];
-                warp_act_base += s_wact[w];
+            for (int w = 0; w < 4; ++w) {
+                if (w < warp) {
+                    warp_off_base += s_wsum[w];
+                    warp_act_base += s_wact[w];
+                }
             }
-        }
-        const int my_off  = warp_off_base + off_inc - cnt;
-        const int my_act  = warp_act_base + act_inc - ((cnt > 0) ? 1 : 0);
-        expert_offsets[e] = my_off;
-        if (cnt > 0) { active_experts[my_act] = e; }
-        if (e == 127) {
-            expert_offsets[kNumExperts] = warp_off_base + off_inc;
-            num_active[0]               = warp_act_base + act_inc;
-        }
-        int cursor = my_off;
-        while (mask != 0ULL) {
-            const int bit          = __ffsll(mask) - 1;
-            sorted_pairs[cursor++] = bit;
-            mask &= (mask - 1ULL);
+            const int my_off  = warp_off_base + off_inc - cnt;
+            const int my_act  = warp_act_base + act_inc - ((cnt > 0) ? 1 : 0);
+            expert_offsets[e] = my_off;
+            if (cnt > 0) { active_experts[my_act] = e; }
+            if (e == 127) {
+                expert_offsets[kNumExperts] = warp_off_base + off_inc;
+                num_active[0]               = warp_act_base + act_inc;
+            }
+            int cursor = my_off;
+            while (mask != 0ULL) {
+                const int bit          = __ffsll(mask) - 1;
+                sorted_pairs[cursor++] = bit;
+                mask &= (mask - 1ULL);
+            }
         }
     }
+}
+
+// ============================================================================
+// 1c. Group C & Group D Mega-Fused Pre-MoE-to-Router Kernels (T == 1, 64 CTAs x 288t)
+// ============================================================================
+
+struct MoeAttnResSources {
+    const __nv_bfloat16* sources[5];
+};
+
+// Group C: ZERO-BARRIER Fused AttnRes<S, Q=1> + mlp_norm + x_staged + Router + Bitonic Top-8!
+// Works on ANY GPU (0 grid barriers -> zero deadlock risk, 0 spills, 100% bit-exact!).
+template <int S, int PrepMode>
+__global__ __launch_bounds__(288, 2) void attn_res_moe_router_t1_kernel(
+    MoeAttnResSources src_args, const float* __restrict__ query,
+    const __nv_bfloat16* __restrict__ mlp_norm_w, const __nv_bfloat16* __restrict__ router_w,
+    const float* __restrict__ router_bias, float route_scale, float eps,
+    __nv_bfloat16* __restrict__ mlp_out, float* __restrict__ router_logits,
+    float* __restrict__ scores_buf, float* __restrict__ raws_buf,
+    std::int32_t* __restrict__ topk_ids, float* __restrict__ topk_weights,
+    std::int32_t* __restrict__ done_counter, half* __restrict__ x_staged) {
+    constexpr int kWarps   = 9;
+    constexpr float kScale = 0.020833333333333332f;
+    __shared__ float s_red[S * 2][kWarps];
+    __shared__ float s_sc[S * 2];
+    __shared__ float s_cs[32];
+    __shared__ int s_cid[32];
+    __shared__ int s_is_last;
+
+    const int row0  = blockIdx.x * 2;
+    const int tid   = threadIdx.x; // 0..287
+    const int warp  = tid >> 5;
+    const int lane  = tid & 31;
+    const int idx   = tid * 8;
+
+    // Issue router_w + bias loads upfront so HBM2 fetches overlap AttnRes compute!
+    const uint4* w0 = reinterpret_cast<const uint4*>(router_w + static_cast<std::int64_t>(row0) * kHidden);
+    const uint4* w1 = reinterpret_cast<const uint4*>(router_w + static_cast<std::int64_t>(row0 + 1) * kHidden);
+    const uint4 wv0 = ld_cg_u4(w0 + tid);
+    const uint4 wv1 = ld_cg_u4(w1 + tid);
+    float b0 = 0.0f, b1 = 0.0f;
+    if (tid == 0) {
+        b0 = __ldg(router_bias + row0);
+        b1 = __ldg(router_bias + row0 + 1);
+    }
+
+    // 1-pass AttnRes: compute BOTH sq[s] AND raw_dot[s] in 1 __syncthreads()!
+    const float4 q0 = __ldg(reinterpret_cast<const float4*>(query + idx));
+    const float4 q1 = __ldg(reinterpret_cast<const float4*>(query + idx + 4));
+    float v_reg[S][8];
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        load_bf16x8(src_args.sources[s] + idx, v_reg[s]);
+        float sq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sq = fmaf(v_reg[s][j], v_reg[s][j], sq); }
+        float dt = fmaf(q0.x, v_reg[s][0],
+                        fmaf(q0.y, v_reg[s][1], fmaf(q0.z, v_reg[s][2], q0.w * v_reg[s][3])));
+        dt = fmaf(q1.x, v_reg[s][4],
+                  fmaf(q1.y, v_reg[s][5], fmaf(q1.z, v_reg[s][6], fmaf(q1.w, v_reg[s][7], dt))));
+        sq = warp_sum(sq);
+        dt = warp_sum(dt);
+        if (lane == 0) {
+            s_red[s][warp]     = sq;
+            s_red[S + s][warp] = dt;
+        }
+    }
+    __syncthreads();
+
+    for (int k = warp; k < 2 * S; k += kWarps) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[k][lane] : 0.0f);
+        if (lane == 0) { s_sc[k] = sum; }
+    }
+    __syncthreads();
+
+    float inv_s[S], sc[S], mx = -1e30f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        inv_s[s] = rsqrtf(s_sc[s] * (1.0f / 2304.0f) + eps);
+        sc[s]    = s_sc[S + s] * inv_s[s] * kScale;
+        mx       = fmaxf(mx, sc[s]);
+    }
+    float ws[S], den = 0.0f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        ws[s] = expf(sc[s] - mx);
+        den += ws[s];
+    }
+    const float inv_d = 1.0f / den;
+#pragma unroll
+    for (int s = 0; s < S; ++s) { ws[s] = (ws[s] * inv_d) * inv_s[s]; }
+
+    float mixed[8], sq_m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int s = 0; s < S; ++s) { acc = fmaf(ws[s], v_reg[s][j], acc); }
+        mixed[j] = acc;
+        sq_m     = fmaf(acc, acc, sq_m);
+    }
+    sq_m = warp_sum(sq_m);
+    if (lane == 0) { s_red[0][warp] = sq_m; }
+    __syncthreads();
+    if (warp == 0) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[0][lane] : 0.0f);
+        if (lane == 0) { s_sc[0] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+    }
+    __syncthreads();
+
+    const float inv_out = s_sc[0];
+    float nw[8];
+    load_bf16x8(mlp_norm_w + idx, nw);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { mixed[j] = mixed[j] * inv_out * nw[j]; }
+    const uint4 xpack = pack_bf16x8(mixed);
+
+    if (blockIdx.x == 0) {
+        reinterpret_cast<uint4*>(mlp_out)[tid] = xpack;
+        if constexpr (PrepMode != 0) {
+            alignas(16) half2 h[4];
+            if constexpr (PrepMode == 1) {
+                bf16x8_to_staged_h2(xpack, h);
+            } else {
+                bf16x8_to_h2(xpack, h);
+            }
+            reinterpret_cast<uint4*>(x_staged)[tid] = *reinterpret_cast<const uint4*>(h);
+        }
+    }
+
+    const auto* wb0 = reinterpret_cast<const __nv_bfloat162*>(&wv0);
+    const auto* wb1 = reinterpret_cast<const __nv_bfloat162*>(&wv1);
+    const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xpack);
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 f0 = __bfloat1622float2(wb0[j]);
+        const float2 f1 = __bfloat1622float2(wb1[j]);
+        const float2 xf = __bfloat1622float2(xb[j]);
+        a0              = fmaf(f0.x, xf.x, fmaf(f0.y, xf.y, a0));
+        a1              = fmaf(f1.x, xf.x, fmaf(f1.y, xf.y, a1));
+    }
+    const float w0s = warp_sum(a0), w1s = warp_sum(a1);
+    if (lane == 0) {
+        s_red[0][warp] = w0s;
+        s_red[1][warp] = w1s;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float s0 = (((s_red[0][0] + s_red[0][1]) + (s_red[0][2] + s_red[0][3])) +
+                          ((s_red[0][4] + s_red[0][5]) + (s_red[0][6] + s_red[0][7]))) +
+                         s_red[0][8];
+        const float s1 = (((s_red[1][0] + s_red[1][1]) + (s_red[1][2] + s_red[1][3])) +
+                          ((s_red[1][4] + s_red[1][5]) + (s_red[1][6] + s_red[1][7]))) +
+                         s_red[1][8];
+        router_logits[row0 + 0] = s0;
+        router_logits[row0 + 1] = s1;
+        const float r0          = 1.0f / (1.0f + expf(-s0));
+        const float r1          = 1.0f / (1.0f + expf(-s1));
+        st_cg_f32(&raws_buf[row0 + 0], r0);
+        st_cg_f32(&raws_buf[row0 + 1], r1);
+        st_cg_f32(&scores_buf[row0 + 0], r0 + b0);
+        st_cg_f32(&scores_buf[row0 + 1], r1 + b1);
+        __threadfence();
+        s_is_last = (atomicAdd(done_counter, 1) == 63) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_is_last) { return; }
+    if (tid == 0) { done_counter[0] = 0; }
+    asm volatile("" ::: "memory");
+    block_bitonic_top8_128(scores_buf, raws_buf, route_scale, s_cs, s_cid, topk_ids, topk_weights);
+}
+
+// Group D: Mega-Fused 2-Barrier 64x288 Pre-MoE Core (ALL 5 stages in ONE launch at T == 1!)
+//   Phase 0+1 (0 bars): Replicated AttnRes<S,1>+Prep + Down [4608->64] (0 loops, 0 z HBM!)
+//   -- Grid Barrier 1 (64 CTAs) --
+//   Phase 2: UpBlend (64 CTAs x 36 ch x 8t = 288t exact!) -> y_buf + partial_sq[64]
+//   -- Grid Barrier 2 (64 CTAs) --
+//   Phase 3+4: PostNorm + x_staged + Router (288t x 1 uint4, 0 loops!) + Bitonic Top-8!
+template <int S, int PrepMode>
+__global__ __launch_bounds__(288, 2) void attn_res_loop_ctrl_moe_router_t1_kernel(
+    MoeAttnResSources src_args, const float* __restrict__ query,
+    const __nv_bfloat16* __restrict__ msg, const __nv_bfloat16* __restrict__ down_w,
+    const __nv_bfloat16* __restrict__ gf_w, const __nv_bfloat16* __restrict__ norm_w,
+    const __nv_bfloat16* __restrict__ router_w, const float* __restrict__ router_bias,
+    float route_scale, float eps, __nv_bfloat16* __restrict__ cur_buf,
+    __nv_bfloat16* __restrict__ h_buf, __nv_bfloat16* __restrict__ y_buf,
+    float* __restrict__ partial_sq, __nv_bfloat16* __restrict__ mlp_out,
+    unsigned int* __restrict__ bar_word, float* __restrict__ router_logits,
+    float* __restrict__ scores_buf, float* __restrict__ raws_buf,
+    std::int32_t* __restrict__ topk_ids, float* __restrict__ topk_weights,
+    std::int32_t* __restrict__ router_done, half* __restrict__ x_staged) {
+    constexpr int kWarps   = 9;
+    constexpr float kScale = 0.020833333333333332f;
+    __shared__ float s_red[S * 2][kWarps];
+    __shared__ float s_sc[S * 2];
+    __shared__ float s_h[64];
+    __shared__ float s_cs[32];
+    __shared__ int s_cid[32];
+    __shared__ float s_inv_y;
+    __shared__ int s_is_last;
+
+    const int bid = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, idx = tid * 8;
+
+    // Issue down_w loads upfront so HBM2 fetches overlap AttnRes+Prep!
+    const uint4* dw_ptr = reinterpret_cast<const uint4*>(down_w + static_cast<std::int64_t>(bid) * 4608);
+    const uint4 dw_cur  = ld_cg_u4(dw_ptr + tid);
+    const uint4 dw_msg  = ld_cg_u4(dw_ptr + 288 + tid);
+
+    const float4 q0 = __ldg(reinterpret_cast<const float4*>(query + idx));
+    const float4 q1 = __ldg(reinterpret_cast<const float4*>(query + idx + 4));
+    float v_reg[S][8];
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        load_bf16x8(src_args.sources[s] + idx, v_reg[s]);
+        float sq = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) { sq = fmaf(v_reg[s][j], v_reg[s][j], sq); }
+        float dt = fmaf(q0.x, v_reg[s][0],
+                        fmaf(q0.y, v_reg[s][1], fmaf(q0.z, v_reg[s][2], q0.w * v_reg[s][3])));
+        dt = fmaf(q1.x, v_reg[s][4],
+                  fmaf(q1.y, v_reg[s][5], fmaf(q1.z, v_reg[s][6], fmaf(q1.w, v_reg[s][7], dt))));
+        sq = warp_sum(sq);
+        dt = warp_sum(dt);
+        if (lane == 0) {
+            s_red[s][warp]     = sq;
+            s_red[S + s][warp] = dt;
+        }
+    }
+    __syncthreads();
+
+    for (int k = warp; k < 2 * S; k += kWarps) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[k][lane] : 0.0f);
+        if (lane == 0) { s_sc[k] = sum; }
+    }
+    __syncthreads();
+
+    float inv_s[S], sc[S], mx = -1e30f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        inv_s[s] = rsqrtf(s_sc[s] * (1.0f / 2304.0f) + eps);
+        sc[s]    = s_sc[S + s] * inv_s[s] * kScale;
+        mx       = fmaxf(mx, sc[s]);
+    }
+    float ws[S], den = 0.0f;
+#pragma unroll
+    for (int s = 0; s < S; ++s) {
+        ws[s] = expf(sc[s] - mx);
+        den += ws[s];
+    }
+    const float inv_d = 1.0f / den;
+#pragma unroll
+    for (int s = 0; s < S; ++s) { ws[s] = (ws[s] * inv_d) * inv_s[s]; }
+
+    float cur_v[8], sq_c = 0.0f;
+    uint4 cur_raw;
+    auto* cur_b = reinterpret_cast<__nv_bfloat162*>(&cur_raw);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        float a = 0.0f, b = 0.0f;
+#pragma unroll
+        for (int s = 0; s < S; ++s) {
+            a = fmaf(ws[s], v_reg[s][2 * j], a);
+            b = fmaf(ws[s], v_reg[s][2 * j + 1], b);
+        }
+        cur_b[j]         = __floats2bfloat162_rn(a, b);
+        const float2 bf  = __bfloat1622float2(cur_b[j]);
+        cur_v[2 * j]     = bf.x;
+        cur_v[2 * j + 1] = bf.y;
+        sq_c             = fmaf(bf.x, bf.x, fmaf(bf.y, bf.y, sq_c));
+    }
+    if (bid == 0) { st_cg_u4(reinterpret_cast<uint4*>(cur_buf) + tid, cur_raw); }
+
+    float msg_v[8], sq_m = 0.0f;
+    load_bf16x8(msg + idx, msg_v);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) { sq_m = fmaf(msg_v[j], msg_v[j], sq_m); }
+    sq_c = warp_sum(sq_c);
+    sq_m = warp_sum(sq_m);
+    if (lane == 0) {
+        s_red[0][warp] = sq_c;
+        s_red[1][warp] = sq_m;
+    }
+    __syncthreads();
+    if (warp < 2) {
+        const float sum = warp_sum((lane < kWarps) ? s_red[warp][lane] : 0.0f);
+        if (lane == 0) { s_sc[warp] = rsqrtf(sum * (1.0f / 2304.0f) + eps); }
+    }
+    __syncthreads();
+
+    // Phase 1: Down [4608->64] directly from registers (ZERO loops, ZERO z HBM!)
+    const float ic  = s_sc[0], im = s_sc[1];
+    const auto* wbc = reinterpret_cast<const __nv_bfloat162*>(&dw_cur);
+    const auto* wbm = reinterpret_cast<const __nv_bfloat162*>(&dw_msg);
+    float acc_c = 0.0f, acc_m = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 wc = __bfloat1622float2(wbc[j]);
+        const float2 wm = __bfloat1622float2(wbm[j]);
+        acc_c           = fmaf(wc.x, cur_v[2 * j], fmaf(wc.y, cur_v[2 * j + 1], acc_c));
+        acc_m           = fmaf(wm.x, msg_v[2 * j], fmaf(wm.y, msg_v[2 * j + 1], acc_m));
+    }
+    const float w_acc = warp_sum(acc_c * ic + acc_m * im);
+    if (lane == 0) { s_red[0][warp] = w_acc; }
+    __syncthreads();
+    if (tid == 0) {
+        const float hval = (((s_red[0][0] + s_red[0][1]) + (s_red[0][2] + s_red[0][3])) +
+                            ((s_red[0][4] + s_red[0][5]) + (s_red[0][6] + s_red[0][7]))) +
+                           s_red[0][8];
+        const __nv_bfloat16 hv = __float2bfloat16_rn(hval);
+        st_cg_u16(&h_buf[bid], *reinterpret_cast<const std::uint16_t*>(&hv));
+    }
+
+    grid_barrier_64(bar_word); // Barrier 1
+
+    // Phase 2: UpBlend (64 CTAs x 36 ch x 8t = 288t exact!)
+    if (tid < 64) {
+        const std::uint16_t hu = ld_cg_u16(&h_buf[tid]);
+        s_h[tid]               = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&hu));
+    }
+    __syncthreads();
+
+    const int ch_loc = tid >> 3, sub = tid & 7, ch = bid * 36 + ch_loc, k_off = sub * 8;
+    const uint4 gw = ld_cg_u4(gf_w + static_cast<std::int64_t>(ch) * 64 + k_off);
+    const uint4 fw = ld_cg_u4(gf_w + static_cast<std::int64_t>(2304 + ch) * 64 + k_off);
+    const auto* gb = reinterpret_cast<const __nv_bfloat162*>(&gw);
+    const auto* fb = reinterpret_cast<const __nv_bfloat162*>(&fw);
+    float g_acc = 0.0f, f_acc = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 g0 = __bfloat1622float2(gb[j]);
+        const float2 f0 = __bfloat1622float2(fb[j]);
+        g_acc = fmaf(g0.x, s_h[k_off + 2 * j], fmaf(g0.y, s_h[k_off + 2 * j + 1], g_acc));
+        f_acc = fmaf(f0.x, s_h[k_off + 2 * j], fmaf(f0.y, s_h[k_off + 2 * j + 1], f_acc));
+    }
+    g_acc += __shfl_xor_sync(0xFFFFFFFFu, g_acc, 1, 8);
+    g_acc += __shfl_xor_sync(0xFFFFFFFFu, g_acc, 2, 8);
+    g_acc += __shfl_xor_sync(0xFFFFFFFFu, g_acc, 4, 8);
+    f_acc += __shfl_xor_sync(0xFFFFFFFFu, f_acc, 1, 8);
+    f_acc += __shfl_xor_sync(0xFFFFFFFFu, f_acc, 2, 8);
+    f_acc += __shfl_xor_sync(0xFFFFFFFFu, f_acc, 4, 8);
+
+    float y_sq = 0.0f;
+    if (sub == 0) {
+        const std::uint16_t cu16 = ld_cg_u16(&cur_buf[ch]);
+        const float cv           = __bfloat162float(*reinterpret_cast<const __nv_bfloat16*>(&cu16));
+        const float mv           = __bfloat162float(__ldg(msg + ch));
+        const float y            = (1.0f - tanhf(f_acc)) * cv + tanhf(g_acc) * mv;
+        y_sq                     = y * y;
+        const __nv_bfloat16 ybf  = __float2bfloat16_rn(y);
+        st_cg_u16(&y_buf[ch], *reinterpret_cast<const std::uint16_t*>(&ybf));
+    }
+    const float wsum = warp_sum(y_sq);
+    if (lane == 0) { s_red[0][warp] = wsum; }
+    __syncthreads();
+    if (tid == 0) {
+        const float tot = (((s_red[0][0] + s_red[0][1]) + (s_red[0][2] + s_red[0][3])) +
+                           ((s_red[0][4] + s_red[0][5]) + (s_red[0][6] + s_red[0][7]))) +
+                          s_red[0][8];
+        st_cg_f32(&partial_sq[bid], tot);
+    }
+
+    grid_barrier_64(bar_word); // Barrier 2
+
+    // Phase 3+4: PostNorm + x_staged + Router + Bitonic Top-8!
+    const int row0  = bid * 2;
+    const uint4* w0 = reinterpret_cast<const uint4*>(router_w + static_cast<std::int64_t>(row0) * kHidden);
+    const uint4* w1 = reinterpret_cast<const uint4*>(router_w + static_cast<std::int64_t>(row0 + 1) * kHidden);
+    const uint4 wv0 = ld_cg_u4(w0 + tid);
+    const uint4 wv1 = ld_cg_u4(w1 + tid);
+    const uint4 yv  = ld_cg_u4(reinterpret_cast<const uint4*>(y_buf) + tid);
+    const uint4 nwv = __ldg(reinterpret_cast<const uint4*>(norm_w) + tid);
+    float b0 = 0.0f, b1 = 0.0f;
+    if (tid == 0) {
+        b0 = __ldg(router_bias + row0);
+        b1 = __ldg(router_bias + row0 + 1);
+    }
+
+    if (warp == 0) {
+        const float acc = warp_reduce_64_f4(partial_sq, lane);
+        if (lane == 0) { s_inv_y = rsqrtf(acc * (1.0f / 2304.0f) + eps); }
+    }
+    __syncthreads();
+    const float inv_y = s_inv_y;
+
+    uint4 xpack;
+    auto* xbp       = reinterpret_cast<__nv_bfloat162*>(&xpack);
+    const auto* ybp = reinterpret_cast<const __nv_bfloat162*>(&yv);
+    const auto* nwp = reinterpret_cast<const __nv_bfloat162*>(&nwv);
+    const auto* wb0 = reinterpret_cast<const __nv_bfloat162*>(&wv0);
+    const auto* wb1 = reinterpret_cast<const __nv_bfloat162*>(&wv1);
+    float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float2 yf  = __bfloat1622float2(ybp[j]);
+        const float2 nwf = __bfloat1622float2(nwp[j]);
+        xbp[j]           = __floats2bfloat162_rn(yf.x * inv_y * nwf.x, yf.y * inv_y * nwf.y);
+        const float2 xf  = __bfloat1622float2(xbp[j]);
+        const float2 f0  = __bfloat1622float2(wb0[j]);
+        const float2 f1  = __bfloat1622float2(wb1[j]);
+        a0               = fmaf(f0.x, xf.x, fmaf(f0.y, xf.y, a0));
+        a1               = fmaf(f1.x, xf.x, fmaf(f1.y, xf.y, a1));
+    }
+
+    if (bid == 0) {
+        reinterpret_cast<uint4*>(mlp_out)[tid] = xpack;
+        if constexpr (PrepMode != 0) {
+            alignas(16) half2 h[4];
+            if constexpr (PrepMode == 1) {
+                bf16x8_to_staged_h2(xpack, h);
+            } else {
+                bf16x8_to_h2(xpack, h);
+            }
+            reinterpret_cast<uint4*>(x_staged)[tid] = *reinterpret_cast<const uint4*>(h);
+        }
+    }
+
+    const float w0s = warp_sum(a0), w1s = warp_sum(a1);
+    if (lane == 0) {
+        s_red[0][warp] = w0s;
+        s_red[1][warp] = w1s;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        const float s0 = (((s_red[0][0] + s_red[0][1]) + (s_red[0][2] + s_red[0][3])) +
+                          ((s_red[0][4] + s_red[0][5]) + (s_red[0][6] + s_red[0][7]))) +
+                         s_red[0][8];
+        const float s1 = (((s_red[1][0] + s_red[1][1]) + (s_red[1][2] + s_red[1][3])) +
+                          ((s_red[1][4] + s_red[1][5]) + (s_red[1][6] + s_red[1][7]))) +
+                         s_red[1][8];
+        router_logits[row0 + 0] = s0;
+        router_logits[row0 + 1] = s1;
+        const float r0          = 1.0f / (1.0f + expf(-s0));
+        const float r1          = 1.0f / (1.0f + expf(-s1));
+        st_cg_f32(&raws_buf[row0 + 0], r0);
+        st_cg_f32(&raws_buf[row0 + 1], r1);
+        st_cg_f32(&scores_buf[row0 + 0], r0 + b0);
+        st_cg_f32(&scores_buf[row0 + 1], r1 + b1);
+        __threadfence();
+        s_is_last = (atomicAdd(router_done, 1) == 63) ? 1 : 0;
+    }
+    __syncthreads();
+    if (!s_is_last) { return; }
+    if (tid == 0) { router_done[0] = 0; }
+    asm volatile("" ::: "memory");
+    block_bitonic_top8_128(scores_buf, raws_buf, route_scale, s_cs, s_cid, topk_ids, topk_weights);
 }
 
 // Large-T (T > 64, prefill) separate topk + grouping
@@ -2312,21 +3043,41 @@ void inkling2_moe_router_fused(const Tensor& x, const Tensor& router_weight,
             CUDA_CHECK(cudaGetDevice(&dev));
             x_staged = get_moe_x_scratch(dev, static_cast<std::size_t>(tokens) * kHidden);
         }
+        // T == 1 ultra-fast 4-warp Bitonic Top-8 path (uses accum_f32[0..255], unused by T==1 MoE!)
+        if (tokens == 1 && scratch.accum_f32 != nullptr) {
+            float* scores_buf = scratch.accum_f32;
+            float* raws_buf   = scratch.accum_f32 + kNumExperts;
+            if (pm == 1) {
+                moe_router_t1_bitonic_288t_kernel<1><<<64, 288, 0, stream>>>(
+                    xp, wp, bp, route_scale, scratch.router_logits, scores_buf, raws_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, x_staged);
+            } else if (pm == 2) {
+                moe_router_t1_bitonic_288t_kernel<2><<<64, 288, 0, stream>>>(
+                    xp, wp, bp, route_scale, scratch.router_logits, scores_buf, raws_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, x_staged);
+            } else {
+                moe_router_t1_bitonic_288t_kernel<0><<<64, 288, 0, stream>>>(
+                    xp, wp, bp, route_scale, scratch.router_logits, scores_buf, raws_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, nullptr);
+            }
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
         auto launch = [&]<int ActiveT>() {
             if (pm == 1) {
-                moe_router_fused_kernel<ActiveT, 1><<<64, 128, 0, stream>>>(
+                moe_router_fused_kernel<ActiveT, 1><<<64, 288, 0, stream>>>(
                     xp, wp, bp, route_scale, scratch.router_logits, scratch.topk_ids,
                     scratch.topk_weights, scratch.expert_counts, scratch.expert_offsets,
                     scratch.sorted_pairs, scratch.active_experts, scratch.num_active,
                     scratch.router_done, x_staged, scratch.accum_f32);
             } else if (pm == 2) {
-                moe_router_fused_kernel<ActiveT, 2><<<64, 128, 0, stream>>>(
+                moe_router_fused_kernel<ActiveT, 2><<<64, 288, 0, stream>>>(
                     xp, wp, bp, route_scale, scratch.router_logits, scratch.topk_ids,
                     scratch.topk_weights, scratch.expert_counts, scratch.expert_offsets,
                     scratch.sorted_pairs, scratch.active_experts, scratch.num_active,
                     scratch.router_done, x_staged, scratch.accum_f32);
             } else {
-                moe_router_fused_kernel<ActiveT, 0><<<64, 128, 0, stream>>>(
+                moe_router_fused_kernel<ActiveT, 0><<<64, 288, 0, stream>>>(
                     xp, wp, bp, route_scale, scratch.router_logits, scratch.topk_ids,
                     scratch.topk_weights, scratch.expert_counts, scratch.expert_offsets,
                     scratch.sorted_pairs, scratch.active_experts, scratch.num_active,
@@ -2349,6 +3100,147 @@ void inkling2_moe_router_fused(const Tensor& x, const Tensor& router_weight,
     Tensor rlog(scratch.router_logits, DType::FP32, {n, tokens});
     inkling2_bf16_linear(x, router_weight, rlog, stream);
     inkling2_moe_route(rlog, router_bias_f32, route_scale, scratch, tokens, stream);
+}
+
+void inkling2_attn_res_moe_router_fused(const void* const* source_ptrs, std::int32_t num_sources,
+                                        const Tensor& query_f32, const Tensor& mlp_norm_w,
+                                        const Tensor& router_weight, const Tensor& router_bias_f32,
+                                        float route_scale, float eps, Tensor& mlp_out,
+                                        Inkling2MoeScratch& scratch, cudaStream_t stream,
+                                        std::int32_t prep_mode) {
+    const int hidden = mlp_out.ne[0];
+    const int tokens = mlp_out.ne[1];
+    if (tokens == 1 && hidden == kHidden && num_sources >= 1 && num_sources <= 5 &&
+        router_weight.ne[1] == kNumExperts && scratch.router_done != nullptr &&
+        scratch.accum_f32 != nullptr) {
+        MoeAttnResSources sa{};
+        for (int s = 0; s < num_sources; ++s) {
+            sa.sources[s] = static_cast<const __nv_bfloat16*>(source_ptrs[s]);
+        }
+        const auto* qp = static_cast<const float*>(query_f32.data);
+        const auto* np = static_cast<const __nv_bfloat16*>(mlp_norm_w.data);
+        const auto* wp = static_cast<const __nv_bfloat16*>(router_weight.data);
+        const auto* bp = static_cast<const float*>(router_bias_f32.data);
+        auto* mo       = static_cast<__nv_bfloat16*>(mlp_out.data);
+        float* sc_buf  = scratch.accum_f32;
+        float* rw_buf  = scratch.accum_f32 + kNumExperts;
+        const int pm   = (prep_mode == 1 || prep_mode == 2) ? prep_mode : 0;
+        half* x_staged = nullptr;
+        if (pm != 0) {
+            int dev = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            x_staged = get_moe_x_scratch(dev, kHidden);
+        }
+        auto launch = [&]<int S>() {
+            if (pm == 1) {
+                attn_res_moe_router_t1_kernel<S, 1><<<64, 288, 0, stream>>>(
+                    sa, qp, np, wp, bp, route_scale, eps, mo, scratch.router_logits, sc_buf, rw_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, x_staged);
+            } else if (pm == 2) {
+                attn_res_moe_router_t1_kernel<S, 2><<<64, 288, 0, stream>>>(
+                    sa, qp, np, wp, bp, route_scale, eps, mo, scratch.router_logits, sc_buf, rw_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, x_staged);
+            } else {
+                attn_res_moe_router_t1_kernel<S, 0><<<64, 288, 0, stream>>>(
+                    sa, qp, np, wp, bp, route_scale, eps, mo, scratch.router_logits, sc_buf, rw_buf,
+                    scratch.topk_ids, scratch.topk_weights, scratch.router_done, nullptr);
+            }
+        };
+        switch (num_sources) {
+        case 1: launch.template operator()<1>(); break;
+        case 2: launch.template operator()<2>(); break;
+        case 3: launch.template operator()<3>(); break;
+        case 4: launch.template operator()<4>(); break;
+        case 5: launch.template operator()<5>(); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    const void* nw[1] = {mlp_norm_w.data};
+    void* outs[1]     = {mlp_out.data};
+    inkling2_attn_res_mix(source_ptrs, num_sources, query_f32, nw, outs, 1, hidden, tokens, eps,
+                          stream);
+    inkling2_moe_router_fused(mlp_out, router_weight, router_bias_f32, route_scale, scratch, stream,
+                              prep_mode);
+}
+
+void inkling2_attn_res_loop_ctrl_moe_router_fused(
+    const void* const* source_ptrs, std::int32_t num_sources, const Tensor& query_f32,
+    const Tensor& msg, const Tensor& down_w, const Tensor& gain_forget_w,
+    const Tensor& mlp_norm_w, const Tensor& router_weight, const Tensor& router_bias_f32,
+    float route_scale, float eps, Tensor& scratch_cur, Tensor& scratch_z, Tensor& scratch_h,
+    Tensor& scratch_gf, std::int32_t* ctrl_done, Tensor& mlp_out, Inkling2MoeScratch& scratch,
+    cudaStream_t stream, std::int32_t prep_mode) {
+    const int hidden = mlp_out.ne[0];
+    const int tokens = mlp_out.ne[1];
+    if (tokens == 1 && hidden == kHidden && num_sources >= 1 && num_sources <= 5 &&
+        down_w.ne[1] == 64 && router_weight.ne[1] == kNumExperts && ctrl_done != nullptr &&
+        scratch.router_done != nullptr && scratch.accum_f32 != nullptr &&
+        scratch_gf.bytes() >= 4864 && get_moe_device_sm_count() >= 64) {
+        MoeAttnResSources sa{};
+        for (int s = 0; s < num_sources; ++s) {
+            sa.sources[s] = static_cast<const __nv_bfloat16*>(source_ptrs[s]);
+        }
+        const auto* qp = static_cast<const float*>(query_f32.data);
+        const auto* mp = static_cast<const __nv_bfloat16*>(msg.data);
+        const auto* dp = static_cast<const __nv_bfloat16*>(down_w.data);
+        const auto* gp = static_cast<const __nv_bfloat16*>(gain_forget_w.data);
+        const auto* np = static_cast<const __nv_bfloat16*>(mlp_norm_w.data);
+        const auto* wp = static_cast<const __nv_bfloat16*>(router_weight.data);
+        const auto* bp = static_cast<const float*>(router_bias_f32.data);
+        auto* cb       = static_cast<__nv_bfloat16*>(scratch_cur.data);
+        auto* hb       = static_cast<__nv_bfloat16*>(scratch_h.data);
+        auto* yb       = static_cast<__nv_bfloat16*>(scratch_gf.data);
+        auto* psq      = reinterpret_cast<float*>(static_cast<char*>(scratch_gf.data) + 4608);
+        auto* mo       = static_cast<__nv_bfloat16*>(mlp_out.data);
+        auto* bar      = reinterpret_cast<unsigned int*>(ctrl_done);
+        float* sc_buf  = scratch.accum_f32;
+        float* rw_buf  = scratch.accum_f32 + kNumExperts;
+        const int pm   = (prep_mode == 1 || prep_mode == 2) ? prep_mode : 0;
+        half* x_staged = nullptr;
+        if (pm != 0) {
+            int dev = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            x_staged = get_moe_x_scratch(dev, kHidden);
+        }
+        auto launch = [&]<int S>() {
+            if (pm == 1) {
+                attn_res_loop_ctrl_moe_router_t1_kernel<S, 1><<<64, 288, 0, stream>>>(
+                    sa, qp, mp, dp, gp, np, wp, bp, route_scale, eps, cb, hb, yb, psq, mo, bar,
+                    scratch.router_logits, sc_buf, rw_buf, scratch.topk_ids, scratch.topk_weights,
+                    scratch.router_done, x_staged);
+            } else if (pm == 2) {
+                attn_res_loop_ctrl_moe_router_t1_kernel<S, 2><<<64, 288, 0, stream>>>(
+                    sa, qp, mp, dp, gp, np, wp, bp, route_scale, eps, cb, hb, yb, psq, mo, bar,
+                    scratch.router_logits, sc_buf, rw_buf, scratch.topk_ids, scratch.topk_weights,
+                    scratch.router_done, x_staged);
+            } else {
+                attn_res_loop_ctrl_moe_router_t1_kernel<S, 0><<<64, 288, 0, stream>>>(
+                    sa, qp, mp, dp, gp, np, wp, bp, route_scale, eps, cb, hb, yb, psq, mo, bar,
+                    scratch.router_logits, sc_buf, rw_buf, scratch.topk_ids, scratch.topk_weights,
+                    scratch.router_done, nullptr);
+            }
+        };
+        switch (num_sources) {
+        case 1: launch.template operator()<1>(); break;
+        case 2: launch.template operator()<2>(); break;
+        case 3: launch.template operator()<3>(); break;
+        case 4: launch.template operator()<4>(); break;
+        case 5: launch.template operator()<5>(); break;
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+
+    // Fallback for T >= 2 (uses single-launch fused loop_control for T=2..8!) or < 64 SMs
+    inkling2_attn_res_mix_and_prep(source_ptrs, num_sources, query_f32, msg, scratch_cur, scratch_z,
+                                   eps, stream);
+    inkling2_loop_control(scratch_cur, msg, down_w, gain_forget_w, &mlp_norm_w, scratch_z,
+                          scratch_h, scratch_gf, mlp_out, eps, stream, /*skip_prep=*/true,
+                          ctrl_done);
+    inkling2_moe_router_fused(mlp_out, router_weight, router_bias_f32, route_scale, scratch, stream,
+                              prep_mode);
 }
 
 void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const void* w13_scales,

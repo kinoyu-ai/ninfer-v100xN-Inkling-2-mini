@@ -12,13 +12,13 @@
 
 | ワークロード / モード | NInfer（ロスレス NVFP4+MXFP8） | `llama.cpp` `UD-Q4_K_XL` | `llama.cpp` `UD-Q8_K_XL` |
 |---|---:|---:|---:|
-| エッセイ 256 tok、C=1 Normal / DSpark-2（e2e） | **122.0** / **127.3 tok/s** | 30.7 tok/s | 29.3 tok/s |
-| エッセイ 256 tok、C=1 / C=4 `temp=0.7, top_p=0.95`（CUDA Graph） | **121.1** / **267.3 tok/s** | — | — |
-| エッセイ 256 tok、C=4 Normal / DSpark-2（合計） | **268.2** / **208.9 tok/s** | 78.3 tok/s | 55.9 tok/s |
-| エッセイ 256 tok、C=8 Normal / DSpark-2（合計） | **356.9** / **241.1 tok/s** | — | — |
-| Python コードリファクタ 256 tok、C=1 Normal / DSpark-2 / DSpark-3（engine） | **128.5** / **168.9** / **166.7 tok/s** | — | — |
-| 4,274 tok ニードル検索、C=1 Normal / DSpark-3 | **114.2** / **181.8 tok/s** | — | — |
-| 16,304 tok 長文デコード、C=1 Normal / DSpark-3 | **99.3** / **131.8 tok/s** | — | — |
+| エッセイ 256 tok、C=1 Normal / DSpark-2 / DSpark-3（e2e） | **135.8** / **129.0** / **129.0 tok/s** | 30.7 tok/s | 29.3 tok/s |
+| エッセイ 256 tok、C=1 / C=4 `temp=0.7, top_p=0.95`（CUDA Graph） | **134.6** / **270.6 tok/s** | — | — |
+| エッセイ 256 tok、C=4 Normal / DSpark-2（合計） | **272.0** / **209.6 tok/s** | 78.3 tok/s | 55.9 tok/s |
+| エッセイ 256 tok、C=8 Normal / DSpark-2（合計） | **358.4** / **238.3 tok/s** | — | — |
+| Python コードリファクタ 256 tok、C=1 Normal / DSpark-2 / DSpark-3（engine） | **139.8** / **174.8** / **176.3 tok/s** | — | — |
+| 4,274 tok ニードル検索、C=1 Normal / DSpark-3 | **124.8** / **152.6 tok/s** | — | — |
+| 16,304 tok 長文デコード、C=1 Normal / DSpark-3 | **107.2** / **110.7 tok/s** | — | — |
 
 ### Cold Prefill スループット・TTFT（512〜65,536 トークン）
 
@@ -37,7 +37,7 @@
 
 - 短〜中長文（512〜8K）では既定の `--prefill-chunk 1024` が **810〜1,034 tok/s** と高速で、16K 以上の長文では `--prefill-chunk 2048` が最大 +2.8%（64K で **417.8 tok/s**）上回ります。
 - DSpark-3 有効時の Prefill オーバーヘッドは全コンテキスト長で **1.3%〜3.6%** に収まります。
-- **172/172** の FP64/TP2 演算子単体テスト（全ホットカーネル 0 B スタック/スピル）、PyTorch リファレンスとの **32/32** 完全トークン一致（Normal Graph/Eager・DSpark-2/3/5/7・Graph キャプチャ Direct BF16 サンプリング経路）、HF `AutoTokenizer` 一致、4K/16K SWA-1024 / Paged-KV 長文デコード、ネイティブ 262K 最大コンテキスト計画、および `C=1..8` 並列サービングを検証済みです。複数トークン処理（Prefill・DSpark 検証・C≥2）の MoE 出力は `atomicAdd` で集約するため、長い生成は実行ごとにビット再現しません。
+- **307/307** の FP64/TP2/CUDA-Graph 演算子単体テスト（全ホットカーネル 0 B スタック/スピル）、PyTorch リファレンスとの **32/32** 完全トークン一致（Normal Graph/Eager・DSpark-2/3/5/7・Graph キャプチャ Direct BF16 サンプリング経路）、HF `AutoTokenizer` 一致、4K/16K SWA-1024 / Paged-KV 長文デコード、ネイティブ 262K 最大コンテキスト計画、および `C=1..8` 並列サービングを検証済みです。複数トークン処理（Prefill・DSpark 検証・C≥2）の MoE 出力は `atomicAdd` で集約するため、長い生成は実行ごとにビット再現しません（DSpark 単発計測の tok/s にはドラフト受容率の揺らぎを含みます）。
 - **V100-32GB×2 互換性**: VRAM 計画や P2P / NVLink / 非 P2P（CUDA UVA ステージング）フォールバック経路は 16 GB VRAM や PCIe 固定の前提を持たないため、同一の `sm_70` ビルドで **2× V100-32GB**（NVLink / PCIe P2P / 非 P2P）および単体 **V100-32GB (`--tp 1`)** に対応します（物理 32 GB V100 実機での単独ベンチマーク計測は未記録です）。
 
 ### Inkling-2-Mini クイックスタート

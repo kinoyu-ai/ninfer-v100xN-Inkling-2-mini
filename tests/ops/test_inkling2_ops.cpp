@@ -865,6 +865,321 @@ void test_norms_attnres_controller(cudaStream_t stream) {
         }
         std::printf("  [PASS] swap_pass_banks exact\n");
     }
+
+    // Wave 6a: Split-Q attn_res_mix (Q=3, T=1 & T=5, with and without post_norm_w)
+    for (int t_case : {1, 5}) {
+        for (bool with_norm : {false, true}) {
+            const int S = 4, Q = 3;
+            std::vector<std::vector<std::uint16_t>> hsrc(S), hnw(Q);
+            std::vector<DevBuf> dsrc, dnw, dout;
+            std::vector<const void*> sptrs(S), nw_ptrs(Q, nullptr);
+            std::vector<void*> optrs(Q);
+            for (int s = 0; s < S; ++s) {
+                hsrc[s] = rand_bf16(rng, t_case * H, 1.0f);
+                dsrc.emplace_back(hsrc[s].size() * 2);
+                dsrc.back().upload(hsrc[s]);
+                sptrs[s] = dsrc.back().ptr;
+            }
+            for (int q = 0; q < Q; ++q) {
+                if (with_norm) {
+                    hnw[q] = rand_bf16(rng, H, 1.0f);
+                    dnw.emplace_back(H * 2);
+                    dnw.back().upload(hnw[q]);
+                    nw_ptrs[q] = dnw.back().ptr;
+                }
+                dout.emplace_back(t_case * H * 2);
+                optrs[q] = dout.back().ptr;
+            }
+            auto hq = rand_f32(rng, Q * H, 1.0f);
+            DevBuf dq(hq.size() * 4);
+            dq.upload(hq);
+            Tensor tq = make_t(dq.ptr, DType::FP32, H, Q);
+
+            ops::inkling2_attn_res_mix(sptrs.data(), S, tq, with_norm ? nw_ptrs.data() : nullptr,
+                                       optrs.data(), Q, H, t_case, eps, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+
+            for (int q = 0; q < Q; ++q) {
+                std::vector<double> ref(t_case * H);
+                for (int t = 0; t < t_case; ++t) {
+                    std::vector<std::vector<double>> v(S, std::vector<double>(H));
+                    for (int s = 0; s < S; ++s) {
+                        double sq = 0.0;
+                        for (int i = 0; i < H; ++i) {
+                            double x = bf16_to_f32(hsrc[s][t * H + i]);
+                            v[s][i]  = x;
+                            sq += x * x;
+                        }
+                        double inv = 1.0 / std::sqrt(sq / H + eps);
+                        for (int i = 0; i < H; ++i) { v[s][i] *= inv; }
+                    }
+                    std::vector<double> scores(S), probs(S);
+                    double mx = -1e30;
+                    for (int s = 0; s < S; ++s) {
+                        double dot = 0.0;
+                        for (int i = 0; i < H; ++i) { dot += hq[q * H + i] * v[s][i]; }
+                        scores[s] = dot / std::sqrt(static_cast<double>(H));
+                        mx        = std::max(mx, scores[s]);
+                    }
+                    double den = 0.0;
+                    for (int s = 0; s < S; ++s) {
+                        probs[s] = std::exp(scores[s] - mx);
+                        den += probs[s];
+                    }
+                    for (int s = 0; s < S; ++s) { probs[s] /= den; }
+                    double sq = 0.0;
+                    std::vector<double> mixed(H, 0.0);
+                    for (int i = 0; i < H; ++i) {
+                        for (int s = 0; s < S; ++s) { mixed[i] += probs[s] * v[s][i]; }
+                        sq += mixed[i] * mixed[i];
+                    }
+                    if (with_norm) {
+                        double inv = 1.0 / std::sqrt(sq / H + eps);
+                        for (int i = 0; i < H; ++i) {
+                            ref[t * H + i] = mixed[i] * inv * bf16_to_f32(hnw[q][i]);
+                        }
+                    } else {
+                        for (int i = 0; i < H; ++i) { ref[t * H + i] = mixed[i]; }
+                    }
+                }
+                char lbl[96];
+                std::snprintf(lbl, sizeof(lbl), "attn_res_mix splitQ3 T=%d norm=%d q=%d",
+                              t_case, with_norm ? 1 : 0, q);
+                check_close(lbl, ref, to_f64_from_bf16(dout[q].download<std::uint16_t>(t_case * H)),
+                            2e-2, 2e-2);
+            }
+        }
+    }
+
+    // Wave 6b: Single-launch fused loop_control (done_counter != nullptr, T=1, 4, 6; plus T=8 fallback)
+    //          + 16-iteration CUDA Graph replay verifying self-reversing barrier!
+    {
+        DevBuf ddone(3 * sizeof(std::int32_t));
+        ddone.zero();
+        auto* bar_ptr = static_cast<std::int32_t*>(ddone.ptr);
+
+        for (int t_case : {1, 4, 6, 8}) {
+            auto hcur = rand_bf16(rng, t_case * H, 0.9f);
+            auto hmsg = rand_bf16(rng, t_case * H, 0.9f);
+            auto hdn  = rand_bf16(rng, 64 * 2 * H, 0.1f);
+            auto hgf  = rand_bf16(rng, 2 * H * 64, 0.1f);
+            auto hnw  = rand_bf16(rng, H, 1.0f);
+            DevBuf dcur(hcur.size() * 2), dmsg(hmsg.size() * 2), ddn(hdn.size() * 2),
+                dgf(hgf.size() * 2), dnw(H * 2);
+            DevBuf dz(t_case * 2 * H * 2), dh(t_case * 64 * 2), dgfs(t_case * 2 * H * 2);
+            DevBuf do_ref(t_case * H * 2), do_fus(t_case * H * 2);
+            dcur.upload(hcur); dmsg.upload(hmsg); ddn.upload(hdn); dgf.upload(hgf); dnw.upload(hnw);
+            Tensor tcur = make_t(dcur.ptr, DType::BF16, H, t_case);
+            Tensor tmsg = make_t(dmsg.ptr, DType::BF16, H, t_case);
+            Tensor tdn  = make_t(ddn.ptr, DType::BF16, 2 * H, 64);
+            Tensor tgf  = make_t(dgf.ptr, DType::BF16, 64, 2 * H);
+            Tensor tnw  = make_t(dnw.ptr, DType::BF16, H);
+            Tensor tz   = make_t(dz.ptr, DType::BF16, 2 * H, t_case);
+            Tensor th   = make_t(dh.ptr, DType::BF16, 64, t_case);
+            Tensor tgfs = make_t(dgfs.ptr, DType::BF16, 2 * H, t_case);
+            Tensor tor  = make_t(do_ref.ptr, DType::BF16, H, t_case);
+            Tensor tof  = make_t(do_fus.ptr, DType::BF16, H, t_case);
+
+            ops::inkling2_loop_control(tcur, tmsg, tdn, tgf, &tnw, tz, th, tgfs, tor, eps, stream,
+                                       false, nullptr);
+            ops::inkling2_loop_control(tcur, tmsg, tdn, tgf, &tnw, tz, th, tgfs, tof, eps, stream,
+                                       false, bar_ptr);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto got_eager = do_fus.download<std::uint16_t>(t_case * H);
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "loop_control fused 1-launch T=%d", t_case);
+            check_close(lbl, to_f64_from_bf16(do_ref.download<std::uint16_t>(t_case * H)),
+                        to_f64_from_bf16(got_eager), 1.5e-2, 1.5e-2);
+
+            // 16-iteration CUDA Graph replay check
+            cudaGraph_t g = nullptr;
+            cudaGraphExec_t gexec = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            ops::inkling2_loop_control(tcur, tmsg, tdn, tgf, &tnw, tz, th, tgfs, tof, eps, stream,
+                                       false, bar_ptr);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&gexec, g, nullptr, nullptr, 0));
+            for (int rep = 0; rep < 16; ++rep) {
+                CUDA_CHECK(cudaGraphLaunch(gexec, stream));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            if (do_fus.download<std::uint16_t>(t_case * H) != got_eager) {
+                throw std::runtime_error("loop_control fused CUDA Graph 16-rep mismatch");
+            }
+            CUDA_CHECK(cudaGraphExecDestroy(gexec));
+            CUDA_CHECK(cudaGraphDestroy(g));
+        }
+
+        for (int t_case : {1, 4, 8}) {
+            std::vector<DevBuf> dcur, dmsg, ddn, dgf, dnw, dor, dof;
+            for (int c = 0; c < 3; ++c) {
+                auto hc = rand_bf16(rng, t_case * H, 0.9f), hm = rand_bf16(rng, t_case * H, 0.9f);
+                auto hd = rand_bf16(rng, 64 * 2 * H, 0.1f), hg = rand_bf16(rng, 2 * H * 64, 0.1f);
+                auto hn = rand_bf16(rng, H, 1.0f);
+                dcur.emplace_back(hc.size() * 2); dcur.back().upload(hc);
+                dmsg.emplace_back(hm.size() * 2); dmsg.back().upload(hm);
+                ddn.emplace_back(hd.size() * 2);  ddn.back().upload(hd);
+                dgf.emplace_back(hg.size() * 2);  dgf.back().upload(hg);
+                dnw.emplace_back(hn.size() * 2);  dnw.back().upload(hn);
+                dor.emplace_back(t_case * H * 2);
+                dof.emplace_back(t_case * H * 2);
+            }
+            DevBuf dz(3 * t_case * 2 * H * 2), dh(3 * t_case * 64 * 2), dgfs(3 * t_case * 2 * H * 2);
+            Tensor tz = make_t(dz.ptr, DType::BF16, 2 * H, 3 * t_case);
+            Tensor th = make_t(dh.ptr, DType::BF16, 64, 3 * t_case);
+            Tensor tg = make_t(dgfs.ptr, DType::BF16, 2 * H, 3 * t_case);
+            Tensor tc0 = make_t(dcur[0].ptr, DType::BF16, H, t_case), tc1 = make_t(dcur[1].ptr, DType::BF16, H, t_case), tc2 = make_t(dcur[2].ptr, DType::BF16, H, t_case);
+            Tensor tm0 = make_t(dmsg[0].ptr, DType::BF16, H, t_case), tm1 = make_t(dmsg[1].ptr, DType::BF16, H, t_case), tm2 = make_t(dmsg[2].ptr, DType::BF16, H, t_case);
+            Tensor td0 = make_t(ddn[0].ptr, DType::BF16, 2 * H, 64),  td1 = make_t(ddn[1].ptr, DType::BF16, 2 * H, 64),  td2 = make_t(ddn[2].ptr, DType::BF16, 2 * H, 64);
+            Tensor tf0 = make_t(dgf[0].ptr, DType::BF16, 64, 2 * H),  tf1 = make_t(dgf[1].ptr, DType::BF16, 64, 2 * H),  tf2 = make_t(dgf[2].ptr, DType::BF16, 64, 2 * H);
+            Tensor tn0 = make_t(dnw[0].ptr, DType::BF16, H),          tn1 = make_t(dnw[1].ptr, DType::BF16, H),          tn2 = make_t(dnw[2].ptr, DType::BF16, H);
+            Tensor tor0 = make_t(dor[0].ptr, DType::BF16, H, t_case), tor1 = make_t(dor[1].ptr, DType::BF16, H, t_case), tor2 = make_t(dor[2].ptr, DType::BF16, H, t_case);
+            Tensor tof0 = make_t(dof[0].ptr, DType::BF16, H, t_case), tof1 = make_t(dof[1].ptr, DType::BF16, H, t_case), tof2 = make_t(dof[2].ptr, DType::BF16, H, t_case);
+
+            ops::inkling2_loop_control_qkv(tc0, tc1, tc2, tm0, tm1, tm2, td0, td1, td2, tf0, tf1, tf2,
+                                           &tn0, &tn1, &tn2, tz, th, tg, tor0, tor1, tor2, eps, stream,
+                                           false, nullptr);
+            ops::inkling2_loop_control_qkv(tc0, tc1, tc2, tm0, tm1, tm2, td0, td1, td2, tf0, tf1, tf2,
+                                           &tn0, &tn1, &tn2, tz, th, tg, tof0, tof1, tof2, eps, stream,
+                                           false, bar_ptr);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<std::vector<std::uint16_t>> eager_qkv(3);
+            for (int c = 0; c < 3; ++c) {
+                eager_qkv[c] = dof[c].download<std::uint16_t>(t_case * H);
+                char lbl[96];
+                std::snprintf(lbl, sizeof(lbl), "loop_control_qkv fused 1-launch T=%d c=%d", t_case, c);
+                check_close(lbl, to_f64_from_bf16(dor[c].download<std::uint16_t>(t_case * H)),
+                            to_f64_from_bf16(eager_qkv[c]), 1.5e-2, 1.5e-2);
+            }
+
+            cudaGraph_t g = nullptr;
+            cudaGraphExec_t gexec = nullptr;
+            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+            ops::inkling2_loop_control_qkv(tc0, tc1, tc2, tm0, tm1, tm2, td0, td1, td2, tf0, tf1, tf2,
+                                           &tn0, &tn1, &tn2, tz, th, tg, tof0, tof1, tof2, eps, stream,
+                                           false, bar_ptr);
+            CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+            CUDA_CHECK(cudaGraphInstantiate(&gexec, g, nullptr, nullptr, 0));
+            for (int rep = 0; rep < 16; ++rep) {
+                CUDA_CHECK(cudaGraphLaunch(gexec, stream));
+            }
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (int c = 0; c < 3; ++c) {
+                if (dof[c].download<std::uint16_t>(t_case * H) != eager_qkv[c]) {
+                    throw std::runtime_error("loop_control_qkv fused CUDA Graph 16-rep mismatch");
+                }
+            }
+            CUDA_CHECK(cudaGraphExecDestroy(gexec));
+            CUDA_CHECK(cudaGraphDestroy(g));
+        }
+
+        // Wave 6c: Mega-fused Group B (attn_res_pair_loop_ctrl_qkv_fused) across S1=1,3,4 x Q1=1,3 x T=1,4
+        for (int t_case : {1, 4}) {
+            for (int s1_case : {1, 3, 4}) {
+                for (int q1_case : {1, 3}) {
+                    std::vector<DevBuf> dbank, dcur_s, dmsg_r, dmsg_f, dcur_r, dcur_f, ddn, dgf, dnw, dor, dof;
+                    const void* bank_ptrs[2];
+                    const void* cur_ptrs[4];
+                    void* mp_r[4]; void* mp_f[4]; void* cp_r[3]; void* cp_f[3];
+                    for (int s = 0; s < 2; ++s) {
+                        auto h = rand_bf16(rng, t_case * H, 0.8f);
+                        dbank.emplace_back(h.size() * 2); dbank.back().upload(h);
+                        bank_ptrs[s] = dbank.back().ptr;
+                    }
+                    for (int s = 0; s < s1_case; ++s) {
+                        auto h = rand_bf16(rng, t_case * H, 0.8f);
+                        dcur_s.emplace_back(h.size() * 2); dcur_s.back().upload(h);
+                        cur_ptrs[s] = dcur_s.back().ptr;
+                    }
+                    auto hcpq = rand_f32(rng, 4 * H, 0.7f), hcurq = rand_f32(rng, q1_case * H, 0.7f);
+                    DevBuf dcpq(hcpq.size() * 4), dcurq(hcurq.size() * 4);
+                    dcpq.upload(hcpq); dcurq.upload(hcurq);
+                    Tensor tcpq  = make_t(dcpq.ptr, DType::FP32, H, 4);
+                    Tensor tcurq = make_t(dcurq.ptr, DType::FP32, H, q1_case);
+                    for (int i = 0; i < 4; ++i) {
+                        dmsg_r.emplace_back(t_case * H * 2); mp_r[i] = dmsg_r.back().ptr;
+                        dmsg_f.emplace_back(t_case * H * 2); mp_f[i] = dmsg_f.back().ptr;
+                    }
+                    for (int c = 0; c < 3; ++c) {
+                        dcur_r.emplace_back(t_case * H * 2); cp_r[c] = dcur_r.back().ptr;
+                        dcur_f.emplace_back(t_case * H * 2); cp_f[c] = dcur_f.back().ptr;
+                        auto hd = rand_bf16(rng, 64 * 2 * H, 0.1f), hg = rand_bf16(rng, 2 * H * 64, 0.1f), hn = rand_bf16(rng, H, 1.0f);
+                        ddn.emplace_back(hd.size() * 2); ddn.back().upload(hd);
+                        dgf.emplace_back(hg.size() * 2); dgf.back().upload(hg);
+                        dnw.emplace_back(hn.size() * 2); dnw.back().upload(hn);
+                        dor.emplace_back(t_case * H * 2);
+                        dof.emplace_back(t_case * H * 2);
+                    }
+                    DevBuf dz(3 * t_case * 2 * H * 2), dh(3 * t_case * 64 * 2), dgfs(3 * t_case * 2 * H * 2);
+                    Tensor tz = make_t(dz.ptr, DType::BF16, 2 * H, 3 * t_case);
+                    Tensor th = make_t(dh.ptr, DType::BF16, 64, 3 * t_case);
+                    Tensor tg = make_t(dgfs.ptr, DType::BF16, 2 * H, 3 * t_case);
+                    Tensor td0 = make_t(ddn[0].ptr, DType::BF16, 2 * H, 64), td1 = make_t(ddn[1].ptr, DType::BF16, 2 * H, 64), td2 = make_t(ddn[2].ptr, DType::BF16, 2 * H, 64);
+                    Tensor tf0 = make_t(dgf[0].ptr, DType::BF16, 64, 2 * H), tf1 = make_t(dgf[1].ptr, DType::BF16, 64, 2 * H), tf2 = make_t(dgf[2].ptr, DType::BF16, 64, 2 * H);
+                    Tensor tn0 = make_t(dnw[0].ptr, DType::BF16, H),         tn1 = make_t(dnw[1].ptr, DType::BF16, H),         tn2 = make_t(dnw[2].ptr, DType::BF16, H);
+                    Tensor tor0 = make_t(dor[0].ptr, DType::BF16, H, t_case), tor1 = make_t(dor[1].ptr, DType::BF16, H, t_case), tor2 = make_t(dor[2].ptr, DType::BF16, H, t_case);
+                    Tensor tof0 = make_t(dof[0].ptr, DType::BF16, H, t_case), tof1 = make_t(dof[1].ptr, DType::BF16, H, t_case), tof2 = make_t(dof[2].ptr, DType::BF16, H, t_case);
+
+                    // Unfused reference
+                    ops::inkling2_attn_res_mix_pair_and_prep_qkv(bank_ptrs, tcpq, mp_r, cur_ptrs, s1_case,
+                                                                 tcurq, cp_r, q1_case, tz, eps, stream);
+                    Tensor tc0r = make_t(cp_r[0], DType::BF16, H, t_case),
+                           tc1r = make_t(cp_r[q1_case == 1 ? 0 : 1], DType::BF16, H, t_case),
+                           tc2r = make_t(cp_r[q1_case == 1 ? 0 : 2], DType::BF16, H, t_case);
+                    Tensor tm0r = make_t(mp_r[0], DType::BF16, H, t_case), tm1r = make_t(mp_r[1], DType::BF16, H, t_case), tm2r = make_t(mp_r[2], DType::BF16, H, t_case);
+                    ops::inkling2_loop_control_qkv(tc0r, tc1r, tc2r, tm0r, tm1r, tm2r, td0, td1, td2,
+                                                   tf0, tf1, tf2, &tn0, &tn1, &tn2, tz, th, tg,
+                                                   tor0, tor1, tor2, eps, stream, true, nullptr);
+
+                    // Mega-fused Group B
+                    ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                        bank_ptrs, tcpq, mp_f, cur_ptrs, s1_case, tcurq, cp_f, q1_case,
+                        td0, td1, td2, tf0, tf1, tf2, tn0, tn1, tn2, tz, th, tg,
+                        tof0, tof1, tof2, eps, stream, bar_ptr);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+                    char lbl[96];
+                    std::snprintf(lbl, sizeof(lbl), "GroupB mega-fused T=%d S1=%d Q1=%d msg3", t_case, s1_case, q1_case);
+                    check_close(lbl, to_f64_from_bf16(dmsg_r[3].download<std::uint16_t>(t_case * H)),
+                                to_f64_from_bf16(dmsg_f[3].download<std::uint16_t>(t_case * H)), 1.5e-2, 1.5e-2);
+                    std::vector<std::vector<std::uint16_t>> eager_b(3);
+                    for (int c = 0; c < 3; ++c) {
+                        eager_b[c] = dof[c].download<std::uint16_t>(t_case * H);
+                        std::snprintf(lbl, sizeof(lbl), "GroupB mega-fused T=%d S1=%d Q1=%d c=%d",
+                                      t_case, s1_case, q1_case, c);
+                        // Unfused quantizes intermediate z[4608] to BF16 while Group B keeps z in FP32;
+                        // through random 0.1-scale down+gf matrices this produces up to ~0.025 diff
+                        // (consistent with loop_control vs FP64 oracle tolerance 5e-2/3e-2).
+                        check_close(lbl, to_f64_from_bf16(dor[c].download<std::uint16_t>(t_case * H)),
+                                    to_f64_from_bf16(eager_b[c]), 4e-2, 2.5e-2);
+                    }
+
+                    if (t_case == 1 && (s1_case == 1 || s1_case == 4)) {
+                        cudaGraph_t g = nullptr;
+                        cudaGraphExec_t gexec = nullptr;
+                        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                        ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                            bank_ptrs, tcpq, mp_f, cur_ptrs, s1_case, tcurq, cp_f, q1_case,
+                            td0, td1, td2, tf0, tf1, tf2, tn0, tn1, tn2, tz, th, tg,
+                            tof0, tof1, tof2, eps, stream, bar_ptr);
+                        CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+                        CUDA_CHECK(cudaGraphInstantiate(&gexec, g, nullptr, nullptr, 0));
+                        for (int rep = 0; rep < 16; ++rep) {
+                            CUDA_CHECK(cudaGraphLaunch(gexec, stream));
+                        }
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        for (int c = 0; c < 3; ++c) {
+                            if (dof[c].download<std::uint16_t>(H) != eager_b[c]) {
+                                throw std::runtime_error("GroupB mega-fused CUDA Graph 16-rep mismatch");
+                            }
+                        }
+                        CUDA_CHECK(cudaGraphExecDestroy(gexec));
+                        CUDA_CHECK(cudaGraphDestroy(g));
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1990,6 +2305,258 @@ void test_sparse_moe(cudaStream_t stream) {
             } else {
                 check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
                             to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+            }
+        }
+
+        // Wave 6d: T==1 Bitonic Router tie-breaking (identical weights/scores -> lowest expert IDs 0..7 win!)
+        {
+            auto hx = rand_bf16(rng, H, 0.3f);
+            std::vector<std::uint16_t> hrw(E * H, 0);
+            std::vector<float> hrb(E, 0.25f);
+            hrb[3]  = 0.5f;
+            hrb[17] = 0.5f;
+            hrb[63] = 0.5f;
+            hrb[64] = 0.5f;
+            hrb[95] = 0.5f;
+            hrb[127] = 0.5f;
+            // All logits == 0 -> raw == 0.5. Top-6 are exact ties at 1.0 (ids 3,17,63,64,95,127),
+            // remaining 2 must be lowest IDs from rest: 0 and 1!
+            DevBuf dx(H * 2), drw(E * H * 2);
+            dx.upload(hx); drw.upload(hrw); d_rbias.upload(hrb);
+            Tensor tx = make_t(dx.ptr, DType::BF16, H, 1), trw = make_t(drw.ptr, DType::BF16, H, E);
+            Tensor trb = make_t(d_rbias.ptr, DType::FP32, E), trl = make_t(d_rlog.ptr, DType::FP32, E, 1);
+            ops::inkling2_bf16_linear(tx, trw, trl, stream);
+            ops::inkling2_moe_route(trl, trb, 8.0f, sc, 1, stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto ref_ids = d_tids.download<std::int32_t>(8);
+
+            ops::inkling2_moe_router_fused(tx, trw, trb, 8.0f, sc, stream, 0);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            auto got_ids = d_tids.download<std::int32_t>(8);
+            const std::vector<std::int32_t> expected = {3, 17, 63, 64, 95, 127, 0, 1};
+            if (got_ids != expected || got_ids != ref_ids) {
+                throw std::runtime_error("moe_router_fused T=1 Bitonic tie-break mismatch");
+            }
+            std::printf("  [PASS] moe_router_fused T=1 Bitonic exact tie-break\n");
+        }
+
+        // Wave 6e: Group C (attn_res_moe_router_fused) across S=1,4,5 x prep_mode=0,2 x T=1,4
+        //          including end-to-end moe_mxfp8_forward(..., skip_prep=true)!
+        for (int t_case : {1, 4}) {
+            for (int s_case : {1, 4, 5}) {
+                for (int pm : {0, 2}) {
+                    const float eps = 1e-6f;
+                    std::vector<DevBuf> dsrc;
+                    const void* sptrs[5];
+                    for (int s = 0; s < s_case; ++s) {
+                        auto hs = rand_bf16(rng, t_case * H, 0.7f);
+                        dsrc.emplace_back(hs.size() * 2); dsrc.back().upload(hs);
+                        sptrs[s] = dsrc.back().ptr;
+                    }
+                    auto hq  = rand_f32(rng, H, 0.6f);
+                    auto hnw = rand_bf16(rng, H, 1.0f);
+                    auto hrw = rand_bf16(rng, E * H, 0.05f);
+                    std::vector<float> hrb(E, -20.0f);
+                    for (int e = 0; e < 12; ++e) { hrb[e] = 2.0f + 0.04f * e; }
+
+                    DevBuf dq(H * 4), dnw(H * 2), drw(E * H * 2);
+                    DevBuf dmlp_r(t_case * H * 2), dmlp_f(t_case * H * 2);
+                    DevBuf dmoe_r(t_case * H * 2), dmoe_f(t_case * H * 2);
+                    dq.upload(hq); dnw.upload(hnw); drw.upload(hrw); d_rbias.upload(hrb);
+
+                    Tensor tq = make_t(dq.ptr, DType::FP32, H, 1), tnw = make_t(dnw.ptr, DType::BF16, H);
+                    Tensor trw = make_t(drw.ptr, DType::BF16, H, E), trb = make_t(d_rbias.ptr, DType::FP32, E);
+                    Tensor tmr = make_t(dmlp_r.ptr, DType::BF16, H, t_case), tmf = make_t(dmlp_f.ptr, DType::BF16, H, t_case);
+                    Tensor tor = make_t(dmoe_r.ptr, DType::BF16, H, t_case), tof = make_t(dmoe_f.ptr, DType::BF16, H, t_case);
+
+                    const void* nw1[1] = {dnw.ptr};
+                    void* out1[1]      = {dmlp_r.ptr};
+                    ops::inkling2_attn_res_mix(sptrs, s_case, tq, nw1, out1, 1, H, t_case, eps, stream);
+                    ops::inkling2_moe_router_fused(tmr, trw, trb, 8.0f, sc, stream, pm);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    auto ref_ids = d_tids.download<std::int32_t>(t_case * 8);
+                    auto ref_w   = d_tw.download<float>(t_case * 8);
+                    if (pm == 2) {
+                        ops::inkling2_moe_mxfp8_forward(tmr, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr,
+                                                        1, 4.0f, 25.0f, sc, tor, stream, true, false);
+                    }
+
+                    ops::inkling2_attn_res_moe_router_fused(sptrs, s_case, tq, tnw, trw, trb, 8.0f,
+                                                            eps, tmf, sc, stream, pm);
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    auto got_ids = d_tids.download<std::int32_t>(t_case * 8);
+                    auto got_w   = d_tw.download<float>(t_case * 8);
+                    if (pm == 2) {
+                        ops::inkling2_moe_mxfp8_forward(tmf, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr,
+                                                        1, 4.0f, 25.0f, sc, tof, stream, true, false);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                    }
+
+                    char lbl[96];
+                    std::snprintf(lbl, sizeof(lbl), "GroupC attn_res_moe_router T=%d S=%d pm=%d",
+                                  t_case, s_case, pm);
+                    check_close(lbl, to_f64_from_bf16(dmlp_r.download<std::uint16_t>(t_case * H)),
+                                to_f64_from_bf16(dmlp_f.download<std::uint16_t>(t_case * H)), 1e-2, 1e-2);
+                    if (ref_ids != got_ids) {
+                        throw std::runtime_error("GroupC topk_ids mismatch");
+                    }
+                    check_close(lbl, to_f64_from_f32(ref_w), to_f64_from_f32(got_w), 1e-4, 1e-4);
+                    if (pm == 2) {
+                        check_close("GroupC -> moe_mxfp8(skip_prep=true)",
+                                    to_f64_from_bf16(dmoe_r.download<std::uint16_t>(t_case * H)),
+                                    to_f64_from_bf16(dmoe_f.download<std::uint16_t>(t_case * H)), 1.5e-2, 1.5e-2);
+                    }
+                }
+            }
+        }
+
+        // Wave 6f: Group D (attn_res_loop_ctrl_moe_router_fused) across S=1,4,5 x pm=0,2 x T=1,4
+        //          + Alternating Group B (72 CTAs) & Group D (64 CTAs) on SAME ctrl_done in 16-rep CUDA Graph!
+        {
+            const float eps = 1e-6f;
+            DevBuf dcdone(3 * sizeof(std::int32_t));
+            dcdone.zero();
+            auto* ctrl_bar = static_cast<std::int32_t*>(dcdone.ptr);
+
+            for (int t_case : {1, 4}) {
+                for (int s_case : {1, 4, 5}) {
+                    for (int pm : {0, 2}) {
+                        std::vector<DevBuf> dsrc;
+                        const void* sptrs[5];
+                        for (int s = 0; s < s_case; ++s) {
+                            auto hs = rand_bf16(rng, t_case * H, 0.7f);
+                            dsrc.emplace_back(hs.size() * 2); dsrc.back().upload(hs);
+                            sptrs[s] = dsrc.back().ptr;
+                        }
+                        auto hq   = rand_f32(rng, H, 0.6f);
+                        auto hmsg = rand_bf16(rng, t_case * H, 0.7f);
+                        auto hdn  = rand_bf16(rng, 64 * 2 * H, 0.1f);
+                        auto hgf  = rand_bf16(rng, 2 * H * 64, 0.1f);
+                        auto hnw  = rand_bf16(rng, H, 1.0f);
+                        auto hrw  = rand_bf16(rng, E * H, 0.05f);
+                        // Separate top-8 margin cleanly (so 1-ULP BF16 vs FP32 y rounding cannot flip
+                        // a random ~0.0001 boundary tie), while checking exact router_logits & weights!
+                        std::vector<float> hrb(E, -20.0f);
+                        for (int e = 0; e < 8; ++e) { hrb[e] = 4.0f + 0.15f * e; }
+                        for (int e = 8; e < 12; ++e) { hrb[e] = 1.5f; }
+
+                        DevBuf dq(H * 4), dmsg(hmsg.size() * 2), ddn(hdn.size() * 2), dgf(hgf.size() * 2);
+                        DevBuf dnw(H * 2), drw(E * H * 2);
+                        DevBuf dcur(t_case * H * 2), dz(t_case * 2 * H * 2), dh(t_case * 64 * 2), dgfs(t_case * 2 * H * 2);
+                        DevBuf dmlp_r(t_case * H * 2), dmlp_f(t_case * H * 2);
+                        DevBuf dmoe_r(t_case * H * 2), dmoe_f(t_case * H * 2);
+                        dq.upload(hq); dmsg.upload(hmsg); ddn.upload(hdn); dgf.upload(hgf);
+                        dnw.upload(hnw); drw.upload(hrw); d_rbias.upload(hrb);
+
+                        Tensor tq   = make_t(dq.ptr, DType::FP32, H, 1), tmsg = make_t(dmsg.ptr, DType::BF16, H, t_case);
+                        Tensor tdn  = make_t(ddn.ptr, DType::BF16, 2 * H, 64), tgf = make_t(dgf.ptr, DType::BF16, 64, 2 * H);
+                        Tensor tnw  = make_t(dnw.ptr, DType::BF16, H), trw = make_t(drw.ptr, DType::BF16, H, E);
+                        Tensor trb  = make_t(d_rbias.ptr, DType::FP32, E);
+                        Tensor tcur = make_t(dcur.ptr, DType::BF16, H, t_case), tz = make_t(dz.ptr, DType::BF16, 2 * H, t_case);
+                        Tensor th   = make_t(dh.ptr, DType::BF16, 64, t_case), tgfs = make_t(dgfs.ptr, DType::BF16, 2 * H, t_case);
+                        Tensor tmr  = make_t(dmlp_r.ptr, DType::BF16, H, t_case), tmf = make_t(dmlp_f.ptr, DType::BF16, H, t_case);
+                        Tensor tor  = make_t(dmoe_r.ptr, DType::BF16, H, t_case), tof = make_t(dmoe_f.ptr, DType::BF16, H, t_case);
+
+                        // Unfused reference
+                        ops::inkling2_attn_res_mix_and_prep(sptrs, s_case, tq, tmsg, tcur, tz, eps, stream);
+                        ops::inkling2_loop_control(tcur, tmsg, tdn, tgf, &tnw, tz, th, tgfs, tmr, eps,
+                                                   stream, true, nullptr);
+                        ops::inkling2_moe_router_fused(tmr, trw, trb, 8.0f, sc, stream, pm);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        auto ref_ids = d_tids.download<std::int32_t>(t_case * 8);
+                        auto ref_w   = d_tw.download<float>(t_case * 8);
+                        if (pm == 2) {
+                            ops::inkling2_moe_mxfp8_forward(tmr, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr,
+                                                            1, 4.0f, 25.0f, sc, tor, stream, true, false);
+                        }
+
+                        // Mega-fused Group D
+                        ops::inkling2_attn_res_loop_ctrl_moe_router_fused(
+                            sptrs, s_case, tq, tmsg, tdn, tgf, tnw, trw, trb, 8.0f, eps, tcur, tz,
+                            th, tgfs, ctrl_bar, tmf, sc, stream, pm);
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        auto got_ids = d_tids.download<std::int32_t>(t_case * 8);
+                        auto got_w   = d_tw.download<float>(t_case * 8);
+                        auto eager_m = dmlp_f.download<std::uint16_t>(t_case * H);
+                        if (pm == 2) {
+                            ops::inkling2_moe_mxfp8_forward(tmf, dw13c.ptr, dw13s.ptr, dw2c.ptr, dw2s.ptr,
+                                                            1, 4.0f, 25.0f, sc, tof, stream, true, false);
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                        }
+
+                        char lbl[96];
+                        std::snprintf(lbl, sizeof(lbl), "GroupD mega-fused T=%d S=%d pm=%d",
+                                      t_case, s_case, pm);
+                        check_close(lbl, to_f64_from_bf16(dmlp_r.download<std::uint16_t>(t_case * H)),
+                                    to_f64_from_bf16(eager_m), 2e-2, 2e-2);
+                        if (ref_ids != got_ids) {
+                            throw std::runtime_error("GroupD topk_ids mismatch");
+                        }
+                        check_close(lbl, to_f64_from_f32(ref_w), to_f64_from_f32(got_w), 5e-3, 5e-3);
+                        if (pm == 2) {
+                            check_close("GroupD -> moe_mxfp8(skip_prep=true)",
+                                        to_f64_from_bf16(dmoe_r.download<std::uint16_t>(t_case * H)),
+                                        to_f64_from_bf16(dmoe_f.download<std::uint16_t>(t_case * H)), 3e-2, 2e-2);
+                        }
+
+                        // Mixed 72-CTA Group B + 64-CTA Group D on SAME ctrl_bar inside 16-rep CUDA Graph!
+                        if (t_case == 1 && s_case == 5 && pm == 2) {
+                            DevBuf dcpq(4 * H * 4), dmsg0(H * 2), dmsg1(H * 2), dmsg2(H * 2), dmsg3(H * 2);
+                            DevBuf dc0(H * 2), dz3(3 * 2 * H * 2), dh3(3 * 64 * 2), dgf3(3 * 2 * H * 2);
+                            DevBuf do0(H * 2), do1(H * 2), do2(H * 2);
+                            dcpq.upload(rand_f32(rng, 4 * H, 0.5f));
+                            const void* bptrs[2] = {sptrs[0], sptrs[1]};
+                            void* mptrs[4]       = {dmsg0.ptr, dmsg1.ptr, dmsg2.ptr, dmsg3.ptr};
+                            void* cptrs[1]       = {dc0.ptr};
+                            Tensor tcpq = make_t(dcpq.ptr, DType::FP32, H, 4);
+                            Tensor tz3  = make_t(dz3.ptr, DType::BF16, 2 * H, 3);
+                            Tensor th3  = make_t(dh3.ptr, DType::BF16, 64, 3);
+                            Tensor tgf3 = make_t(dgf3.ptr, DType::BF16, 2 * H, 3);
+                            Tensor to0  = make_t(do0.ptr, DType::BF16, H, 1);
+                            Tensor to1  = make_t(do1.ptr, DType::BF16, H, 1);
+                            Tensor to2  = make_t(do2.ptr, DType::BF16, H, 1);
+                            Tensor tmsg3 = make_t(dmsg3.ptr, DType::BF16, H, 1);
+
+                            // Run once eager to get reference outputs for the chained pair
+                            ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                                bptrs, tcpq, mptrs, sptrs, 4, tq, cptrs, 1,
+                                tdn, tdn, tdn, tgf, tgf, tgf, tnw, tnw, tnw,
+                                tz3, th3, tgf3, to0, to1, to2, eps, stream, ctrl_bar);
+                            ops::inkling2_attn_res_loop_ctrl_moe_router_fused(
+                                sptrs, 5, tq, tmsg3, tdn, tgf, tnw, trw, trb, 8.0f, eps,
+                                tcur, tz, th, tgfs, ctrl_bar, tmf, sc, stream, 2);
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            auto ref_o0  = do0.download<std::uint16_t>(H);
+                            auto ref_mlp = dmlp_f.download<std::uint16_t>(H);
+                            auto ref_id2 = d_tids.download<std::int32_t>(8);
+
+                            cudaGraph_t g = nullptr;
+                            cudaGraphExec_t gexec = nullptr;
+                            CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+                            ops::inkling2_attn_res_pair_loop_ctrl_qkv_fused(
+                                bptrs, tcpq, mptrs, sptrs, 4, tq, cptrs, 1,
+                                tdn, tdn, tdn, tgf, tgf, tgf, tnw, tnw, tnw,
+                                tz3, th3, tgf3, to0, to1, to2, eps, stream, ctrl_bar);
+                            ops::inkling2_attn_res_loop_ctrl_moe_router_fused(
+                                sptrs, 5, tq, tmsg3, tdn, tgf, tnw, trw, trb, 8.0f, eps,
+                                tcur, tz, th, tgfs, ctrl_bar, tmf, sc, stream, 2);
+                            CUDA_CHECK(cudaStreamEndCapture(stream, &g));
+                            CUDA_CHECK(cudaGraphInstantiate(&gexec, g, nullptr, nullptr, 0));
+                            for (int rep = 0; rep < 16; ++rep) {
+                                CUDA_CHECK(cudaGraphLaunch(gexec, stream));
+                            }
+                            CUDA_CHECK(cudaStreamSynchronize(stream));
+                            if (do0.download<std::uint16_t>(H) != ref_o0 ||
+                                dmlp_f.download<std::uint16_t>(H) != ref_mlp ||
+                                d_tids.download<std::int32_t>(8) != ref_id2) {
+                                throw std::runtime_error("Mixed GroupB(72)+GroupD(64) CUDA Graph 16-rep mismatch");
+                            }
+                            CUDA_CHECK(cudaGraphExecDestroy(gexec));
+                            CUDA_CHECK(cudaGraphDestroy(g));
+                            std::printf("  [PASS] Mixed GroupB(72-CTA) + GroupD(64-CTA) shared ctrl_done 16-rep CUDA Graph\n");
+                        }
+                    }
+                }
             }
         }
     }
