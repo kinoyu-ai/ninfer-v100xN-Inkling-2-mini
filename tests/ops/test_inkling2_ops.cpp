@@ -83,7 +83,11 @@ struct DevBuf {
         return v;
     }
     void zero() {
-        if (bytes > 0) { CUDA_CHECK(cudaMemset(ptr, 0, bytes)); }
+        if (bytes > 0) {
+            // Legacy-stream memset must complete before kernels on the non-blocking test stream.
+            CUDA_CHECK(cudaMemset(ptr, 0, bytes));
+            CUDA_CHECK(cudaStreamSynchronize(nullptr));
+        }
     }
 };
 
@@ -1450,10 +1454,13 @@ void test_attention(cudaStream_t stream) {
     }
 
     // Wave 4 Long-Context Adaptive Last-CTA Split-KV (total_k = 1200 -> eff_splits > 1)
-    // Exercises BOTH cyclic SWA ring wrap (ring_cap=1024) AND paged global (20 permuted pages)!
-    for (bool is_local : {true, false}) {
-        const int total_k = 1200, q_per = 4, swa_win = 1024;
-        const int ring_cap = 1024, max_pages = 20;
+    // Exercises BOTH cyclic SWA ring wrap (ring_cap=1024) AND paged global (permuted pages)!
+    // total_k = 4096 (global only) gives >= 160 keys per split, which selects the Wave 5
+    // warp-uniform single-exp online softmax route for T >= 2 global attention.
+    for (const int total_k : {1200, 4096}) for (bool is_local : {true, false}) {
+        if (is_local && total_k != 1200) { continue; }
+        const int q_per = 4, swa_win = 1024;
+        const int ring_cap = 1024, max_pages = (total_k + 63) / 64 + 4;
         auto hq_l    = rand_bf16(rng, q_per * n_q * D, 0.4f);
         auto hqgrs_l = rand_bf16(rng, q_per * packed, 0.4f);
         auto hrb_l   = rand_f32(rng, q_per * n_q * rel_ext, 0.1f);
@@ -1461,7 +1468,9 @@ void test_attention(cudaStream_t stream) {
         auto hv_all  = rand_bf16(rng, total_k * n_kv * D, 0.35f);
 
         std::vector<std::int32_t> hbt(max_pages);
-        for (int p = 0; p < max_pages; ++p) { hbt[p] = (p * 7 + 3) % max_pages; }
+        // Deterministic physical-page permutation (independent of the data RNG stream).
+        std::iota(hbt.begin(), hbt.end(), 0);
+        std::shuffle(hbt.begin(), hbt.end(), std::mt19937(907));
         std::vector<std::uint16_t> hring_k(ring_cap * n_kv * D, 0), hring_v(ring_cap * n_kv * D, 0);
         std::vector<std::uint16_t> hpage_k(max_pages * n_kv * 64 * D, 0), hpage_v(max_pages * n_kv * 64 * D, 0);
         for (int kp = 0; kp < total_k; ++kp) {
@@ -1557,9 +1566,10 @@ void test_attention(cudaStream_t stream) {
         }
         auto got_all = to_f64_from_bf16(dout.download<std::uint16_t>(q_per * n_q * D));
         std::vector<double> got_last(got_all.begin() + qi * n_q * D, got_all.end());
-        check_close(is_local ? "attn SWA long-ctx adaptive Split-KV (1200) vs FP64"
-                             : "attn Full long-ctx adaptive Split-KV (1200) vs FP64",
-                    ref, got_last, 2e-2, 2e-2);
+        char lbl[96];
+        std::snprintf(lbl, sizeof(lbl), "attn %s long-ctx adaptive Split-KV (%d) vs FP64",
+                      is_local ? "SWA" : "Full", total_k);
+        check_close(lbl, ref, got_last, 2e-2, 2e-2);
     }
 }
 
@@ -2348,15 +2358,19 @@ void test_dspark_ops(cudaStream_t stream) {
     }
 
     // Wave 4: mtp_block_attention long-context adaptive Last-CTA Split-KV (ctx_len=1100, SWA & Paged Global)
-    for (bool is_local : {true, false}) {
-        const int ctx_len = 1100, blk_sz = 4, swa_win = 1024, ring_cap = 1024, max_pages = 20;
+    // ctx_len = 4100 (global only) selects the Wave 5 single-exp online softmax route (>= 160 keys/split).
+    for (const int ctx_len : {1100, 4100}) for (bool is_local : {true, false}) {
+        if (is_local && ctx_len != 1100) { continue; }
+        const int blk_sz = 4, swa_win = 1024, ring_cap = 1024, max_pages = (ctx_len + 63) / 64 + 4;
         auto hq  = rand_bf16(rng, blk_sz * n_q * D, 0.4f);
         auto hkb = rand_bf16(rng, blk_sz * n_kv * D, 0.4f);
         auto hvb = rand_bf16(rng, blk_sz * n_kv * D, 0.4f);
         auto hkc = rand_bf16(rng, ctx_len * n_kv * D, 0.35f);
         auto hvc = rand_bf16(rng, ctx_len * n_kv * D, 0.35f);
         std::vector<std::int32_t> hbt(max_pages);
-        for (int p = 0; p < max_pages; ++p) { hbt[p] = (p * 11 + 5) % max_pages; }
+        // Deterministic physical-page permutation (independent of the data RNG stream).
+        std::iota(hbt.begin(), hbt.end(), 0);
+        std::shuffle(hbt.begin(), hbt.end(), std::mt19937(911));
         std::vector<std::uint16_t> hrk(ring_cap * n_kv * D, 0), hrv(ring_cap * n_kv * D, 0);
         std::vector<std::uint16_t> hpk(max_pages * n_kv * 64 * D, 0), hpv(max_pages * n_kv * 64 * D, 0);
         for (int kp = 0; kp < ctx_len; ++kp) {
@@ -2428,8 +2442,10 @@ void test_dspark_ops(cudaStream_t stream) {
             for (int d = 0; d < D; ++d) { ref[qh * D + d] = acc[d] / den; }
         }
         auto got_all = to_f64_from_bf16(dout.download<std::uint16_t>(blk_sz * n_q * D));
-        check_close(is_local ? "mtp_block_attn SWA long-ctx Split-KV (1100) vs FP64"
-                             : "mtp_block_attn Full long-ctx Split-KV (1100) vs FP64",
+        char mlbl[96];
+        std::snprintf(mlbl, sizeof(mlbl), "mtp_block_attn %s long-ctx Split-KV (%d) vs FP64",
+                      is_local ? "SWA" : "Full", ctx_len);
+        check_close(mlbl,
                     ref, std::vector<double>(got_all.begin() + bi * n_q * D, got_all.begin() + (bi + 1) * n_q * D),
                     1.5e-2, 1.5e-2);
     }
