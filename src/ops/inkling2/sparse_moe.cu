@@ -427,6 +427,22 @@ __global__ __launch_bounds__(128, 4) void moe_router_fused_kernel(
     if constexpr (ActiveT == 1) {
         if (warp == 0) {
             warp_select_top8_128(router_logits, bias, route_scale, topk_ids, topk_weights, nullptr);
+        } else if constexpr (PrepMode != 0) {
+            // Warps 1..3 (96 threads) are idle during Warp-0 top-8 selection:
+            // stage x[2304] -> x_staged (288 uint4 / 96 = 3 exact coalesced iters!) for free!
+            const int wtid = tid - 32; // 0..95
+#pragma unroll
+            for (int it = 0; it < 3; ++it) {
+                const int idx   = wtid + it * 96; // 0..287
+                const uint4 raw = __ldg(reinterpret_cast<const uint4*>(x) + idx);
+                alignas(16) half2 h[4];
+                if constexpr (PrepMode == 1) {
+                    bf16x8_to_staged_h2(raw, h);
+                } else {
+                    bf16x8_to_h2(raw, h);
+                }
+                reinterpret_cast<uint4*>(x_staged)[idx] = *reinterpret_cast<const uint4*>(h);
+            }
         }
         return;
     } else {
@@ -571,8 +587,9 @@ __global__ void moe_group_assignments_large_kernel(
 //           2 threads/row x uint4 = 32B exact HBM2 sector, 2-deep prefetch, 1 shuffle!)
 // ============================================================================
 
+template <bool PreStaged>
 __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w13_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ w13_codes,
+    const void* __restrict__ x_in, const std::uint8_t* __restrict__ w13_codes,
     const std::uint8_t* __restrict__ w13_scales, const float* __restrict__ w13_amax,
     const float* __restrict__ w13_denom, const std::int32_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weights, int num_slabs, float gate_cap, float up_cap,
@@ -580,15 +597,22 @@ __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w13_kernel(
     __shared__ uint4 s_x[144][2];
 
     const int tid = threadIdx.x; // 0..127
-    for (int g = tid; g < 144; g += 128) {
-        const uint4 x0 = __ldg(reinterpret_cast<const uint4*>(x + g * 16));
-        const uint4 x1 = __ldg(reinterpret_cast<const uint4*>(x + g * 16 + 8));
-        alignas(16) half2 xa0[4];
-        alignas(16) half2 xa1[4];
-        bf16x8_to_staged_h2(x0, xa0);
-        bf16x8_to_staged_h2(x1, xa1);
-        s_x[g][0] = *reinterpret_cast<const uint4*>(xa0);
-        s_x[g][1] = *reinterpret_cast<const uint4*>(xa1);
+    if constexpr (PreStaged) {
+        const auto* xp = static_cast<const uint4*>(x_in);
+        auto* sx_flat  = reinterpret_cast<uint4*>(s_x);
+        for (int idx = tid; idx < 288; idx += 128) { sx_flat[idx] = __ldg(xp + idx); }
+    } else {
+        const auto* x = static_cast<const __nv_bfloat16*>(x_in);
+        for (int g = tid; g < 144; g += 128) {
+            const uint4 x0 = __ldg(reinterpret_cast<const uint4*>(x + g * 16));
+            const uint4 x1 = __ldg(reinterpret_cast<const uint4*>(x + g * 16 + 8));
+            alignas(16) half2 xa0[4];
+            alignas(16) half2 xa1[4];
+            bf16x8_to_staged_h2(x0, xa0);
+            bf16x8_to_staged_h2(x1, xa1);
+            s_x[g][0] = *reinterpret_cast<const uint4*>(xa0);
+            s_x[g][1] = *reinterpret_cast<const uint4*>(xa1);
+        }
     }
     __syncthreads();
 
@@ -764,21 +788,29 @@ __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w2_kernel(
 // 3. Warp-Aligned Zero-Spill MXFP8 T == 1 Kernels (128 threads/CTA, 0 SMEM reduce!)
 // ============================================================================
 
+template <bool PreStaged>
 __global__ __launch_bounds__(128, 6) void moe_mxfp8_t1_w13_kernel(
-    const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ w13_codes,
+    const void* __restrict__ x_in, const std::uint8_t* __restrict__ w13_codes,
     const std::uint8_t* __restrict__ w13_scales, const std::int32_t* __restrict__ topk_ids,
     const float* __restrict__ topk_weights, int num_slabs, float gate_cap, float up_cap,
     half* __restrict__ inter_out) {
     alignas(16) __shared__ half2 s_x[72][16];
 
     const int tid = threadIdx.x;
-    for (int idx = tid; idx < 288; idx += 128) {
-        const int g    = idx >> 2; // 0..71
-        const int q    = idx & 3;  // 0..3
-        const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x + g * 32 + q * 8));
-        alignas(16) half2 xh[4];
-        bf16x8_to_h2(xv, xh);
-        *reinterpret_cast<uint4*>(&s_x[g][q * 4]) = *reinterpret_cast<const uint4*>(xh);
+    if constexpr (PreStaged) {
+        const auto* xp = static_cast<const uint4*>(x_in);
+        auto* sx_flat  = reinterpret_cast<uint4*>(s_x);
+        for (int idx = tid; idx < 288; idx += 128) { sx_flat[idx] = __ldg(xp + idx); }
+    } else {
+        const auto* x = static_cast<const __nv_bfloat16*>(x_in);
+        for (int idx = tid; idx < 288; idx += 128) {
+            const int g    = idx >> 2; // 0..71
+            const int q    = idx & 3;  // 0..3
+            const uint4 xv = __ldg(reinterpret_cast<const uint4*>(x + g * 32 + q * 8));
+            alignas(16) half2 xh[4];
+            bf16x8_to_h2(xv, xh);
+            *reinterpret_cast<uint4*>(&s_x[g][q * 4]) = *reinterpret_cast<const uint4*>(xh);
+        }
     }
     __syncthreads();
 
@@ -2274,7 +2306,7 @@ void inkling2_moe_router_fused(const Tensor& x, const Tensor& router_weight,
         const auto* wp = static_cast<const __nv_bfloat16*>(router_weight.data);
         const auto* bp = static_cast<const float*>(router_bias_f32.data);
         half* x_staged = nullptr;
-        const int pm   = (tokens >= 2 && (prep_mode == 1 || prep_mode == 2)) ? prep_mode : 0;
+        const int pm   = (prep_mode == 1 || prep_mode == 2) ? prep_mode : 0;
         if (pm != 0) {
             int dev = 0;
             CUDA_CHECK(cudaGetDevice(&dev));
@@ -2330,12 +2362,22 @@ void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const vo
     if (tokens == 1) {
         const int inter_local = num_slabs * kInterPerSlab;
         const dim3 g1(inter_local / 16, kTopK);
-        moe_nvfp4_t1_w13_kernel<<<g1, 128, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(w13_codes),
-            static_cast<const std::uint8_t*>(w13_scales), w13_amax, w13_denom, scratch.topk_ids,
-            scratch.topk_weights, num_slabs, gate_cap, up_cap,
-            static_cast<half*>(scratch.intermediate_bf16));
+        if (skip_prep) {
+            int dev = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            const half* x_staged = get_moe_x_scratch(dev, kHidden);
+            moe_nvfp4_t1_w13_kernel<true><<<g1, 128, 0, stream>>>(
+                x_staged, static_cast<const std::uint8_t*>(w13_codes),
+                static_cast<const std::uint8_t*>(w13_scales), w13_amax, w13_denom, scratch.topk_ids,
+                scratch.topk_weights, num_slabs, gate_cap, up_cap,
+                static_cast<half*>(scratch.intermediate_bf16));
+        } else {
+            moe_nvfp4_t1_w13_kernel<false><<<g1, 128, 0, stream>>>(
+                x.data, static_cast<const std::uint8_t*>(w13_codes),
+                static_cast<const std::uint8_t*>(w13_scales), w13_amax, w13_denom, scratch.topk_ids,
+                scratch.topk_weights, num_slabs, gate_cap, up_cap,
+                static_cast<half*>(scratch.intermediate_bf16));
+        }
         CUDA_CHECK(cudaGetLastError());
 
         moe_nvfp4_t1_w2_kernel<<<kHidden / 8, 128, 0, stream>>>(
@@ -2422,11 +2464,20 @@ void inkling2_moe_mxfp8_forward(const Tensor& x, const void* w13_codes, const vo
     if (tokens == 1) {
         const int inter_local = num_slabs * kInterPerSlab;
         const dim3 g1(inter_local / 16, kTopK);
-        moe_mxfp8_t1_w13_kernel<<<g1, 128, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const std::uint8_t*>(w13_codes),
-            static_cast<const std::uint8_t*>(w13_scales), scratch.topk_ids, scratch.topk_weights,
-            num_slabs, gate_cap, up_cap, static_cast<half*>(scratch.intermediate_bf16));
+        if (skip_prep) {
+            int dev = 0;
+            CUDA_CHECK(cudaGetDevice(&dev));
+            const half* x_fp16 = get_moe_x_scratch(dev, kHidden);
+            moe_mxfp8_t1_w13_kernel<true><<<g1, 128, 0, stream>>>(
+                x_fp16, static_cast<const std::uint8_t*>(w13_codes),
+                static_cast<const std::uint8_t*>(w13_scales), scratch.topk_ids, scratch.topk_weights,
+                num_slabs, gate_cap, up_cap, static_cast<half*>(scratch.intermediate_bf16));
+        } else {
+            moe_mxfp8_t1_w13_kernel<false><<<g1, 128, 0, stream>>>(
+                x.data, static_cast<const std::uint8_t*>(w13_codes),
+                static_cast<const std::uint8_t*>(w13_scales), scratch.topk_ids, scratch.topk_weights,
+                num_slabs, gate_cap, up_cap, static_cast<half*>(scratch.intermediate_bf16));
+        }
         CUDA_CHECK(cudaGetLastError());
 
         moe_mxfp8_t1_w2_kernel<<<kHidden / 8, 128, 0, stream>>>(

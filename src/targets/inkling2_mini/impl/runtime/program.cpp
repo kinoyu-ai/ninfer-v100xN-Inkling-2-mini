@@ -1024,9 +1024,10 @@ public:
             ranks_[0].dev->synchronize();
             if (!use_cuda_graph_ && tp_ == 2) { ranks_[1].dev->synchronize(); }
         } else {
-            // Eager forward + stochastic sampling / logit capture
-            run_forward_body(ForwardMode::Decode, B, 1, 0, 0, mtp_enabled_);
-            sample_or_capture_logits(lanes, ops::kSamplePurposeDecode, pending_tokens_);
+            // Graph-captured forward + direct BF16 unembed + gather, then rank-0 stochastic sample!
+            run_decode_logits_maybe_graph(B);
+            sample_from_gathered_logits(lanes, ops::kSamplePurposeDecode, pending_tokens_);
+            if (!use_cuda_graph_ && tp_ == 2) { ranks_[1].dev->synchronize(); }
         }
 
         const double dt = std::chrono::duration<double>(Clock::now() - t0).count();
@@ -1580,7 +1581,7 @@ private:
             }
 
             // --- Part B: (unfused attn_sconv if needed) + Pre-MoE AttnRes/Control + Router + MoE ---
-            const bool fuse_moe_prep = (T >= 2 && T <= 8);
+            const bool fuse_moe_prep = (T >= 1 && T <= 8);
             const bool fuse_moe_cast = (T >= 2 && can_fuse_tp2_ar_sconv);
             for (int r = 0; r < tp_; ++r) {
                 auto& rs     = ranks_[static_cast<std::size_t>(r)];
@@ -1831,10 +1832,8 @@ private:
         CUDA_CHECK(cudaSetDevice(ec_.primary().device));
     }
 
-    // ---- Output Head + Full BF16 Logits + Stochastic Sampling / Logit Capture ----
-    void sample_or_capture_logits(std::span<const std::uint32_t> lanes, std::int32_t purpose,
-                                  std::vector<TokenId>& out_tokens, int src_row_offset = 0) {
-        const int B = static_cast<int>(lanes.size());
+    // ---- Output Head + Direct Fused BF16 Logits + Gather to Rank 0 (CUDA-Graph-capturable!) ----
+    void run_unembed_bf16_gather(int num_rows, int src_row_offset) {
         std::array<Tensor, 2> bf16_shards{};
         for (int r = 0; r < tp_; ++r) {
             auto& rs       = ranks_[static_cast<std::size_t>(r)];
@@ -1842,16 +1841,15 @@ private:
             CUDA_CHECK(cudaSetDevice(rs.dev->device));
             Tensor h_in(static_cast<std::byte*>(rs.final_h.data) +
                             static_cast<std::size_t>(src_row_offset) * kHiddenSize * 2,
-                        DType::BF16, {kHiddenSize, B});
-            Tensor l_f32(rs.logits_shard_f32.data, DType::FP32, {rs.model->vocab_rows, B});
+                        DType::BF16, {kHiddenSize, num_rows});
             bf16_shards[r] = Tensor(rs.logits_shard_bf16.data, DType::BF16,
-                                    {rs.model->vocab_rows, B});
+                                    {rs.model->vocab_rows, num_rows});
+            // Direct BF16 fused softcap + valid-cols mask (zero FP32 HBM round-trip, zero cast!)
             ops::inkling2_unembed_project(h_in, rs.model->output_head, kFinalLogitSoftcap,
-                                          rs.model->valid_rows, &l_f32, nullptr, nullptr, s);
-            ops::cast_fp32_to_bf16(l_f32, bf16_shards[r], s);
+                                          rs.model->valid_rows, &bf16_shards[r], nullptr, nullptr, s);
         }
 
-        Tensor full_logits(ranks_[0].logits_full_bf16.data, DType::BF16, {kPaddedVocabSize, B});
+        Tensor full_logits(ranks_[0].logits_full_bf16.data, DType::BF16, {kPaddedVocabSize, num_rows});
         if (tp_ == 2) {
             ops::gather_columns_rank0(full_logits, std::span<const Tensor>(bf16_shards.data(), 2),
                                       ec_, *peer_events_);
@@ -1860,7 +1858,14 @@ private:
             CUDA_CHECK(cudaMemcpyAsync(full_logits.data, bf16_shards[0].data, full_logits.bytes(),
                                        cudaMemcpyDeviceToDevice, ranks_[0].dev->stream));
         }
+        CUDA_CHECK(cudaSetDevice(ec_.primary().device));
+    }
 
+    // ---- Stochastic Sampling / Logit Capture from Rank-0 Gathered BF16 Logits ----
+    void sample_from_gathered_logits(std::span<const std::uint32_t> lanes, std::int32_t purpose,
+                                     std::vector<TokenId>& out_tokens) {
+        const int B = static_cast<int>(lanes.size());
+        Tensor full_logits(ranks_[0].logits_full_bf16.data, DType::BF16, {kPaddedVocabSize, B});
         CUDA_CHECK(cudaSetDevice(ranks_[0].dev->device));
         cudaStream_t s0 = ranks_[0].dev->stream;
 
@@ -2394,6 +2399,13 @@ private:
         });
     }
 
+    void run_decode_logits_maybe_graph(int B) {
+        run_graph_or_eager(decode_logits_graphs_[static_cast<std::size_t>(B - 1)], [&] {
+            run_forward_body(ForwardMode::Decode, B, 1, 0, 0, mtp_enabled_);
+            run_unembed_bf16_gather(B, 0);
+        });
+    }
+
     void run_verify_step_maybe_graph(int B, int V) {
         run_graph_or_eager(verify_graphs_[static_cast<std::size_t>(B - 1)], [&] {
             run_forward_body(ForwardMode::Verify, B, V, 0, 0, true);
@@ -2462,9 +2474,10 @@ private:
             } else {
                 std::vector<TokenId> tok_vec;
                 const std::uint32_t l_arr[1] = {lane};
-                sample_or_capture_logits(std::span<const std::uint32_t>(l_arr, 1),
-                                         ops::kSamplePurposePrefill, tok_vec,
-                                         static_cast<int>(count) - 1);
+                run_unembed_bf16_gather(1, static_cast<int>(count) - 1);
+                sample_from_gathered_logits(std::span<const std::uint32_t>(l_arr, 1),
+                                            ops::kSamplePurposePrefill, tok_vec);
+                if (tp_ == 2) { ranks_[1].dev->synchronize(); }
                 st.last_token = tok_vec[0];
             }
             res.round.tokens = std::span<const TokenId>(&st.last_token, 1);
@@ -2494,6 +2507,7 @@ private:
     std::array<LaneState, kMaximumConcurrency> lanes_{};
 
     std::array<GraphSlot, kMaximumConcurrency> decode_graphs_{};
+    std::array<GraphSlot, kMaximumConcurrency> decode_logits_graphs_{};
     std::array<GraphSlot, kMaximumConcurrency> verify_graphs_{};
     std::array<GraphSlot, kMaximumConcurrency> draft_graphs_{};
     std::size_t last_graph_nodes_ = 0;

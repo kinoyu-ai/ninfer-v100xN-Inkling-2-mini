@@ -315,7 +315,7 @@ __global__ void attn_prologue_fused_kernel(
 //      ZERO reduce kernel launches across ALL 48 layers!).
 // ============================================================================
 
-template <int kWarps>
+template <int kWarps, bool AllowOneExp>
 __global__ __launch_bounds__(kWarps * 32, 8) void attn_qhead_adaptive_kernel(
     const __nv_bfloat16* __restrict__ q, const __nv_bfloat16* __restrict__ qgrs,
     const float* __restrict__ rel_bias, Inkling2KvTarget kv,
@@ -411,39 +411,124 @@ __global__ __launch_bounds__(kWarps * 32, 8) void attn_qhead_adaptive_kernel(
         const std::int32_t* bt    = kv.block_tables + static_cast<std::int64_t>(lane) * kv.max_logical_pages;
         int cached_lpage          = -1;
         std::int64_t page_kv_base = 0;
-        for (; kpos < k_end; kpos += kWarps) {
-            const int lpage = kpos >> 6;
-            if (lpage != cached_lpage) {
-                cached_lpage = lpage;
-                const int pp = __ldg(bt + lpage);
-                page_kv_base = (static_cast<std::int64_t>(pp) * num_kv_heads + kv_h) * kPageSize;
+        if constexpr (AllowOneExp) {
+            if (k_end - k_beg >= 160) {
+                for (; kpos < k_end; kpos += kWarps) {
+                    const int lpage = kpos >> 6;
+                    if (lpage != cached_lpage) {
+                        cached_lpage = lpage;
+                        const int pp = __ldg(bt + lpage);
+                        page_kv_base =
+                            (static_cast<std::int64_t>(pp) * num_kv_heads + kv_h) * kPageSize;
+                    }
+                    const std::int64_t off = (page_kv_base + (kpos & 63)) * kHeadDim + d_base;
+                    const uint2 kraw       = __ldg(reinterpret_cast<const uint2*>(pk_base + off));
+                    const uint2 vraw       = __ldg(reinterpret_cast<const uint2*>(pv_base + off));
+                    const auto* kb         = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+                    const auto* vb         = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+                    const float2 kf0       = __bfloat1622float2(kb[0]);
+                    const float2 kf1       = __bfloat1622float2(kb[1]);
+                    const float2 vf0       = __bfloat1622float2(vb[0]);
+                    const float2 vf1       = __bfloat1622float2(vb[1]);
+
+                    float dot      = q0 * kf0.x + q1 * kf0.y + q2 * kf1.x + q3 * kf1.y;
+                    dot            = __shfl_sync(0xFFFFFFFFu, warp_sum(dot), 0);
+                    const int dist = q_pos - kpos;
+                    if (dist < kRelExt) { dot += __ldg(rb_row + dist); }
+
+                    // Warp-uniform 1-exp online softmax (halves MUFU.EX2 & FMULs on SFU-bound T>=2 long ctx!)
+                    if (dot > m) {
+                        const float alpha = (m == -std::numeric_limits<float>::infinity())
+                                                ? 0.0f
+                                                : __expf(m - dot);
+                        l  = fmaf(l, alpha, 1.0f);
+                        a0 = fmaf(a0, alpha, vf0.x);
+                        a1 = fmaf(a1, alpha, vf0.y);
+                        a2 = fmaf(a2, alpha, vf1.x);
+                        a3 = fmaf(a3, alpha, vf1.y);
+                        m  = dot;
+                    } else {
+                        const float p = __expf(dot - m);
+                        l += p;
+                        a0 = fmaf(p, vf0.x, a0);
+                        a1 = fmaf(p, vf0.y, a1);
+                        a2 = fmaf(p, vf1.x, a2);
+                        a3 = fmaf(p, vf1.y, a3);
+                    }
+                }
+            } else {
+                for (; kpos < k_end; kpos += kWarps) {
+                    const int lpage = kpos >> 6;
+                    if (lpage != cached_lpage) {
+                        cached_lpage = lpage;
+                        const int pp = __ldg(bt + lpage);
+                        page_kv_base =
+                            (static_cast<std::int64_t>(pp) * num_kv_heads + kv_h) * kPageSize;
+                    }
+                    const std::int64_t off = (page_kv_base + (kpos & 63)) * kHeadDim + d_base;
+                    const uint2 kraw       = __ldg(reinterpret_cast<const uint2*>(pk_base + off));
+                    const uint2 vraw       = __ldg(reinterpret_cast<const uint2*>(pv_base + off));
+                    const auto* kb         = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+                    const auto* vb         = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+                    const float2 kf0       = __bfloat1622float2(kb[0]);
+                    const float2 kf1       = __bfloat1622float2(kb[1]);
+                    const float2 vf0       = __bfloat1622float2(vb[0]);
+                    const float2 vf1       = __bfloat1622float2(vb[1]);
+
+                    float dot      = q0 * kf0.x + q1 * kf0.y + q2 * kf1.x + q3 * kf1.y;
+                    dot            = __shfl_sync(0xFFFFFFFFu, warp_sum(dot), 0);
+                    const int dist = q_pos - kpos;
+                    if (dist < kRelExt) { dot += __ldg(rb_row + dist); }
+
+                    const float new_m = fmaxf(m, dot);
+                    const float alpha = (m == -std::numeric_limits<float>::infinity())
+                                            ? 0.0f
+                                            : __expf(m - new_m);
+                    const float p     = __expf(dot - new_m);
+                    l                 = l * alpha + p;
+                    a0                = fmaf(p, vf0.x, a0 * alpha);
+                    a1                = fmaf(p, vf0.y, a1 * alpha);
+                    a2                = fmaf(p, vf1.x, a2 * alpha);
+                    a3                = fmaf(p, vf1.y, a3 * alpha);
+                    m                 = new_m;
+                }
             }
-            const std::int64_t off = (page_kv_base + (kpos & 63)) * kHeadDim + d_base;
-            const uint2 kraw       = __ldg(reinterpret_cast<const uint2*>(pk_base + off));
-            const uint2 vraw       = __ldg(reinterpret_cast<const uint2*>(pv_base + off));
-            const auto* kb         = reinterpret_cast<const __nv_bfloat162*>(&kraw);
-            const auto* vb         = reinterpret_cast<const __nv_bfloat162*>(&vraw);
-            const float2 kf0       = __bfloat1622float2(kb[0]);
-            const float2 kf1       = __bfloat1622float2(kb[1]);
-            const float2 vf0       = __bfloat1622float2(vb[0]);
-            const float2 vf1       = __bfloat1622float2(vb[1]);
+        } else {
+            for (; kpos < k_end; kpos += kWarps) {
+                const int lpage = kpos >> 6;
+                if (lpage != cached_lpage) {
+                    cached_lpage = lpage;
+                    const int pp = __ldg(bt + lpage);
+                    page_kv_base =
+                        (static_cast<std::int64_t>(pp) * num_kv_heads + kv_h) * kPageSize;
+                }
+                const std::int64_t off = (page_kv_base + (kpos & 63)) * kHeadDim + d_base;
+                const uint2 kraw       = __ldg(reinterpret_cast<const uint2*>(pk_base + off));
+                const uint2 vraw       = __ldg(reinterpret_cast<const uint2*>(pv_base + off));
+                const auto* kb         = reinterpret_cast<const __nv_bfloat162*>(&kraw);
+                const auto* vb         = reinterpret_cast<const __nv_bfloat162*>(&vraw);
+                const float2 kf0       = __bfloat1622float2(kb[0]);
+                const float2 kf1       = __bfloat1622float2(kb[1]);
+                const float2 vf0       = __bfloat1622float2(vb[0]);
+                const float2 vf1       = __bfloat1622float2(vb[1]);
 
-            float dot = q0 * kf0.x + q1 * kf0.y + q2 * kf1.x + q3 * kf1.y;
-            dot       = __shfl_sync(0xFFFFFFFFu, warp_sum(dot), 0);
-            const int dist = q_pos - kpos;
-            if (dist < kRelExt) { dot += __ldg(rb_row + dist); }
+                float dot      = q0 * kf0.x + q1 * kf0.y + q2 * kf1.x + q3 * kf1.y;
+                dot            = __shfl_sync(0xFFFFFFFFu, warp_sum(dot), 0);
+                const int dist = q_pos - kpos;
+                if (dist < kRelExt) { dot += __ldg(rb_row + dist); }
 
-            const float new_m = fmaxf(m, dot);
-            const float alpha = (m == -std::numeric_limits<float>::infinity())
-                                    ? 0.0f
-                                    : __expf(m - new_m);
-            const float p     = __expf(dot - new_m);
-            l                 = l * alpha + p;
-            a0                = fmaf(p, vf0.x, a0 * alpha);
-            a1                = fmaf(p, vf0.y, a1 * alpha);
-            a2                = fmaf(p, vf1.x, a2 * alpha);
-            a3                = fmaf(p, vf1.y, a3 * alpha);
-            m                 = new_m;
+                const float new_m = fmaxf(m, dot);
+                const float alpha = (m == -std::numeric_limits<float>::infinity())
+                                        ? 0.0f
+                                        : __expf(m - new_m);
+                const float p     = __expf(dot - new_m);
+                l                 = l * alpha + p;
+                a0                = fmaf(p, vf0.x, a0 * alpha);
+                a1                = fmaf(p, vf0.y, a1 * alpha);
+                a2                = fmaf(p, vf1.x, a2 * alpha);
+                a3                = fmaf(p, vf1.y, a3 * alpha);
+                m                 = new_m;
+            }
         }
     }
 
@@ -1093,14 +1178,25 @@ void inkling2_attn_decode_verify(const Tensor& q, const Tensor& q_gate_r_sink,
             num_splits  = kv.is_local ? std::min(cap_splits, 2) : std::min(cap_splits, 4);
             min_split_k = 128;
         }
-        attn_qhead_adaptive_kernel<4>
-            <<<dim3(num_q_heads, total_tokens, num_splits), 128, 0, stream>>>(
-                static_cast<const __nv_bfloat16*>(q.data),
-                static_cast<const __nv_bfloat16*>(q_gate_r_sink.data),
-                static_cast<const float*>(rel_bias_f32.data), kv, lane_ids, q_positions, q_per_lane,
-                packed_stride, gate_offset, sink_offset, num_q_heads, num_kv_heads, swa_window,
-                num_splits, min_split_k, split_scratch, split_done,
-                static_cast<__nv_bfloat16*>(out.data));
+        if (!kv.is_local && total_tokens >= 2) {
+            attn_qhead_adaptive_kernel<4, true>
+                <<<dim3(num_q_heads, total_tokens, num_splits), 128, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(q_gate_r_sink.data),
+                    static_cast<const float*>(rel_bias_f32.data), kv, lane_ids, q_positions,
+                    q_per_lane, packed_stride, gate_offset, sink_offset, num_q_heads, num_kv_heads,
+                    swa_window, num_splits, min_split_k, split_scratch, split_done,
+                    static_cast<__nv_bfloat16*>(out.data));
+        } else {
+            attn_qhead_adaptive_kernel<4, false>
+                <<<dim3(num_q_heads, total_tokens, num_splits), 128, 0, stream>>>(
+                    static_cast<const __nv_bfloat16*>(q.data),
+                    static_cast<const __nv_bfloat16*>(q_gate_r_sink.data),
+                    static_cast<const float*>(rel_bias_f32.data), kv, lane_ids, q_positions,
+                    q_per_lane, packed_stride, gate_offset, sink_offset, num_q_heads, num_kv_heads,
+                    swa_window, num_splits, min_split_k, split_scratch, split_done,
+                    static_cast<__nv_bfloat16*>(out.data));
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

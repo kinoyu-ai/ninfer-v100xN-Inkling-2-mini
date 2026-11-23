@@ -591,9 +591,10 @@ __global__ void tp2_packet_allreduce_sconv_decode_kernel(
 }
 
 // Verify Fused Kernel: each 64-thread CTA owns exactly 1 epoch domain (`epochs[blockIdx.x]`),
-// handling `packs_per_cta = 64 / verify_len` channel packs across ALL `v = 0..verify_len-1`!
-// 100% compatible with PeerEvents two-epoch protocol (zero races, works for all V in [2..8], B in [1..8])!
-template <bool InputFp32>
+// handling `packs_per_cta = 64 / V` channel packs across ALL `v = 0..V-1`!
+// Row-major Phase 1 gives 100% coalesced global reads/writes & block copies, while Phase 2
+// reads `s_sum[v * packs_per_cta + s_local_bp]` with zero SMEM bank conflicts and compile-time FixV!
+template <bool InputFp32, int FixV>
 __global__ void tp2_packet_allreduce_sconv_verify_kernel(
     const void* __restrict__ source, Bf16x8Pack* __restrict__ local,
     Bf16x8Pack* __restrict__ peer, unsigned* __restrict__ epochs, int epoch_packs,
@@ -605,20 +606,21 @@ __global__ void tp2_packet_allreduce_sconv_verify_kernel(
     __shared__ Bf16x8Pack s_sum[64];
 
     const int tid           = threadIdx.x; // 0..63
-    const int packs_per_cta = 64 / verify_len;
+    const int V             = (FixV > 0) ? FixV : verify_len;
+    const int packs_per_cta = (FixV > 0) ? (64 / FixV) : (64 / verify_len);
     const int packs_per_row = channels >> 3;
     const int total_bp      = batch_size * packs_per_row;
     const unsigned epoch    = epochs[blockIdx.x] & 1U;
 
-    // Phase 1: Packet push / wait / clear within this block's exclusive 64-slot epoch domain!
-    const int local_bp = tid / verify_len;
-    const int v_slot   = tid - local_bp * verify_len;
+    // Phase 1: Coalesced row-major packet push / wait / clear within this block's 64-slot epoch domain!
+    const int v_slot   = tid / packs_per_cta;
+    const int local_bp = tid - v_slot * packs_per_cta;
     const int bp       = static_cast<int>(blockIdx.x) * packs_per_cta + local_bp;
 
-    if (local_bp < packs_per_cta && bp < total_bp) {
-        const int b           = bp / packs_per_row;
-        const int p           = bp - b * packs_per_row;
-        const int row_idx     = b * verify_len + v_slot;
+    if (v_slot < V && bp < total_bp) {
+        const int b           = (batch_size == 1) ? 0 : (bp / packs_per_row);
+        const int p           = (batch_size == 1) ? bp : (bp - b * packs_per_row);
+        const int row_idx     = b * V + v_slot;
         const int tensor_pack = row_idx * packs_per_row + p;
 
         if (block_copy_src != nullptr && block_copy_dst != nullptr) {
@@ -660,15 +662,15 @@ __global__ void tp2_packet_allreduce_sconv_verify_kernel(
     __syncthreads();
     if (tid == 0) { epochs[blockIdx.x] = epoch ^ 1U; }
 
-    // Phase 2: Vectorized 4-channel/thread SConv + residual + verify state save across v = 0..verify_len-1!
-    // Since verify_len >= 2, packs_per_cta <= 32, so packs_per_cta * 2 <= 64 threads cover all 8 channels/pack!
+    // Phase 2: Vectorized 4-channel/thread SConv + residual + verify state save across v = 0..V-1!
+    // Since V >= 2, packs_per_cta <= 32, so packs_per_cta * 2 <= 64 threads cover all 8 channels/pack!
     const int s_local_bp = tid >> 1;
     const int half4      = tid & 1;
     const int s_bp       = static_cast<int>(blockIdx.x) * packs_per_cta + s_local_bp;
     if (s_local_bp >= packs_per_cta || s_bp >= total_bp) { return; }
 
-    const int b    = s_bp / packs_per_row;
-    const int p    = s_bp - b * packs_per_row;
+    const int b    = (batch_size == 1) ? 0 : (s_bp / packs_per_row);
+    const int p    = (batch_size == 1) ? s_bp : (s_bp - b * packs_per_row);
     const int c0   = (p << 3) + (half4 << 2);
     const int lane = lane_ids[b];
 
@@ -689,17 +691,19 @@ __global__ void tp2_packet_allreduce_sconv_verify_kernel(
     float4 s1 = *reinterpret_cast<const float4*>(st_in + 1 * channels + c0);
     float4 s2 = *reinterpret_cast<const float4*>(st_in + 2 * channels + c0);
 
-    for (int v = 0; v < verify_len; ++v) {
-        const Bf16x8Pack& pk = s_sum[s_local_bp * verify_len + v];
-        const float2 x01     = __bfloat1622float2(pk.pair[half4 * 2 + 0]);
-        const float2 x23     = __bfloat1622float2(pk.pair[half4 * 2 + 1]);
+    std::int64_t out_off = static_cast<std::int64_t>(b * V) * channels + c0;
+    for (int v = 0; v < V; ++v) {
+        // Bank-conflict-free SMEM read: consecutive channel packs occupy consecutive banks!
+        const uint2 xraw = reinterpret_cast<const uint2*>(&s_sum[v * packs_per_cta + s_local_bp])[half4];
+        const auto* xb   = reinterpret_cast<const __nv_bfloat162*>(&xraw);
+        const float2 x01 = __bfloat1622float2(xb[0]);
+        const float2 x23 = __bfloat1622float2(xb[1]);
 
         float y0 = (w0a.x * s0.x + w0a.y * s1.x + w0b.x * s2.x + w0b.y * x01.x + x01.x) * kInvSqrt5;
         float y1 = (w1a.x * s0.y + w1a.y * s1.y + w1b.x * s2.y + w1b.y * x01.y + x01.y) * kInvSqrt5;
         float y2 = (w2a.x * s0.z + w2a.y * s1.z + w2b.x * s2.z + w2b.y * x23.x + x23.x) * kInvSqrt5;
         float y3 = (w3a.x * s0.w + w3a.y * s1.w + w3b.x * s2.w + w3b.y * x23.y + x23.y) * kInvSqrt5;
 
-        const std::int64_t out_off = static_cast<std::int64_t>(b * verify_len + v) * channels + c0;
         if (residual_add != nullptr) {
             const uint2 rraw = __ldg(reinterpret_cast<const uint2*>(residual_add + out_off));
             const auto* rb   = reinterpret_cast<const __nv_bfloat162*>(&rraw);
@@ -724,6 +728,7 @@ __global__ void tp2_packet_allreduce_sconv_verify_kernel(
         *reinterpret_cast<float4*>(vst + 0 * channels + c0) = s0;
         *reinterpret_cast<float4*>(vst + 1 * channels + c0) = s1;
         *reinterpret_cast<float4*>(vst + 2 * channels + c0) = s2;
+        out_off += channels;
     }
 }
 
@@ -1041,26 +1046,30 @@ void inkling2_tp2_packet_allreduce_sconv_verify(
     auto* epochs            = reinterpret_cast<unsigned*>(
         static_cast<std::uint8_t*>(local_storage) + 2 * epoch_bytes);
     const bool is_f32 = (partial_in.dtype == DType::FP32);
+    auto launch = [&]<bool Fp32>() {
+        auto run_v = [&]<int FixV>() {
+            tp2_packet_allreduce_sconv_verify_kernel<Fp32, FixV><<<blocks, 64, 0, stream>>>(
+                partial_in.data, static_cast<Bf16x8Pack*>(local_storage),
+                static_cast<Bf16x8Pack*>(peer_storage), epochs, epoch_packs,
+                static_cast<const __nv_bfloat16*>(sconv_weight.data), state_pool,
+                verify_states_pool, lane_ids, channels, batch_size, verify_len, state_lane_stride,
+                max_v, static_cast<__nv_bfloat16*>(out.data),
+                residual_add ? static_cast<const __nv_bfloat16*>(residual_add->data) : nullptr,
+                block_copy_src ? static_cast<const Bf16x8Pack*>(block_copy_src->data) : nullptr,
+                block_copy_dst ? static_cast<Bf16x8Pack*>(block_copy_dst->data) : nullptr);
+        };
+        switch (verify_len) {
+        case 3: run_v.template operator()<3>(); break;
+        case 4: run_v.template operator()<4>(); break;
+        case 6: run_v.template operator()<6>(); break;
+        case 8: run_v.template operator()<8>(); break;
+        default: run_v.template operator()<0>(); break;
+        }
+    };
     if (is_f32) {
-        tp2_packet_allreduce_sconv_verify_kernel<true><<<blocks, 64, 0, stream>>>(
-            partial_in.data, static_cast<Bf16x8Pack*>(local_storage),
-            static_cast<Bf16x8Pack*>(peer_storage), epochs, epoch_packs,
-            static_cast<const __nv_bfloat16*>(sconv_weight.data), state_pool, verify_states_pool,
-            lane_ids, channels, batch_size, verify_len, state_lane_stride, max_v,
-            static_cast<__nv_bfloat16*>(out.data),
-            residual_add ? static_cast<const __nv_bfloat16*>(residual_add->data) : nullptr,
-            block_copy_src ? static_cast<const Bf16x8Pack*>(block_copy_src->data) : nullptr,
-            block_copy_dst ? static_cast<Bf16x8Pack*>(block_copy_dst->data) : nullptr);
+        launch.template operator()<true>();
     } else {
-        tp2_packet_allreduce_sconv_verify_kernel<false><<<blocks, 64, 0, stream>>>(
-            partial_in.data, static_cast<Bf16x8Pack*>(local_storage),
-            static_cast<Bf16x8Pack*>(peer_storage), epochs, epoch_packs,
-            static_cast<const __nv_bfloat16*>(sconv_weight.data), state_pool, verify_states_pool,
-            lane_ids, channels, batch_size, verify_len, state_lane_stride, max_v,
-            static_cast<__nv_bfloat16*>(out.data),
-            residual_add ? static_cast<const __nv_bfloat16*>(residual_add->data) : nullptr,
-            block_copy_src ? static_cast<const Bf16x8Pack*>(block_copy_src->data) : nullptr,
-            block_copy_dst ? static_cast<Bf16x8Pack*>(block_copy_dst->data) : nullptr);
+        launch.template operator()<false>();
     }
     CUDA_CHECK(cudaGetLastError());
 }

@@ -38,7 +38,9 @@ void inkling2_bf16_linear_5way(const Tensor& x0, const Tensor& w0, Tensor& out0,
 
 // Output head + optional softcap + optional vocab-limit masking + optional local argmax.
 // w: BF16 [K, N_shard], x: BF16 [K, T].
-// If logits_out != nullptr: writes FP32 [N_shard, T] (softcapped, masked beyond valid_shard_cols).
+// If logits_out != nullptr: writes FP32 or BF16 [N_shard, T] (softcapped, masked beyond valid_shard_cols).
+//   When logits_out->dtype == DType::BF16 (with max_vals == nullptr && max_ids == nullptr), fuses
+//   softcap + masking + BF16 rounding directly into the GEMV/small-T epilogue (zero FP32 HBM round-trip).
 // If max_vals != nullptr && max_ids != nullptr: writes per-row local argmax over valid_shard_cols.
 void inkling2_unembed_project(const Tensor& x, const Tensor& w, float softcap,
                               std::int32_t valid_shard_cols, Tensor* logits_out,

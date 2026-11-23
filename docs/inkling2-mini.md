@@ -77,24 +77,27 @@ Workload: 4 essay prompts (`C=1, 4`) and 8 essay prompts (`C=8`), `max_tokens=25
 
 | Engine / Mode | Weights | C=1 e2e (tok/s) | C=4 agg (tok/s) | C=8 agg (tok/s) |
 |---|---|---:|---:|---:|
-| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **122.10** *(was 104.79, +16.5%)* | **268.98** *(was 238.01, +13.0%)* | **348.83** *(was 313.24, +11.4%)* |
-| **NInfer DSpark-2** (`--spec mtp --draft-tokens 2`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **126.04** *(was 106.88, +17.9%)* | **211.87** *(was 175.42, +20.8%)* | **238.72** *(was 224.33, +6.4%)* |
-| **NInfer DSpark-3** (`--spec mtp --draft-tokens 3`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **119.46** *(was 102.01, +17.1%)* | **186.80** *(was 166.17, +12.4%)* | — |
-| **NInfer DSpark-7** (`--spec dflash --draft-tokens 7`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **88.91** *(was 75.16, +18.3%)* | **120.80** *(was 104.65, +15.4%)* | — |
+| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **122.0** *(was 104.8, +16.4%)* | **268.2** *(was 238.0, +12.7%)* | **356.9** *(peak 358.2; was 313.2, +13.9%)* |
+| **NInfer Normal (`temp=0.7, top_p=0.95`)** | Native NVFP4 + MXFP8 + BF16 (lossless) | **121.1** *(CUDA Graph + Direct BF16)* | **267.3** *(within 0.3% of greedy)* | — |
+| **NInfer DSpark-2** (`--spec mtp --draft-tokens 2`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **127.3** *(peak 127.9; was 106.9, +19.1%)* | **208.9** *(was 175.4, +19.1%)* | **241.1** *(peak 242.6; was 224.3, +7.5%)* |
+| **NInfer DSpark-3** (`--spec mtp --draft-tokens 3`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **122.0** *(peak 126.2; was 102.0, +19.6%)* | **189.9** *(peak 191.9; was 166.2, +14.3%)* | — |
+| **NInfer DSpark-7** (`--spec dflash --draft-tokens 7`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **94.5** *(peak 97.0; was 75.2, +25.7%)* | **119.4** *(peak 122.5; was 104.7, +14.1%)* | — |
 | `llama.cpp` Normal | `UD-Q4_K_XL` (requantized GGUF) | 30.7 | 78.3 | — |
 | `llama.cpp` Normal | `UD-Q8_K_XL` (requantized GGUF) | 29.3 | 55.9 | — |
 | `llama.cpp` + DSpark-3 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 29.3 / 19.8 | 47.7 / 28.5 | — |
 | `llama.cpp` + DSpark-7 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 24.2 / 16.3 | 39.3 / 23.8 | — |
 
-- Compared with `llama.cpp UD-Q4_K_XL` Normal: **3.98×** faster at C=1 Normal (`122.1` vs `30.7`, **4.11×** with DSpark-2 at `126.0`) and **3.44×** faster at C=4 (`269.0` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
-- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.17×** faster at C=1 and **4.81×** faster at C=4.
+- Compared with `llama.cpp UD-Q4_K_XL` Normal: **3.97×** faster at C=1 Normal (`122.0` vs `30.7`, **4.15×** with DSpark-2 at `127.3`) and **3.43×** faster at C=4 (`268.2` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
+- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.16×** faster at C=1 and **4.80×** faster at C=4.
+- Non-greedy stochastic serving (`temperature=0.7, top_p=0.95`) now runs inside cross-device CUDA Graphs with direct BF16 softcapped unembed (`121.1 tok/s` at C=1, `267.3 tok/s` at C=4 — within **0.3%–0.7%** of greedy).
 
-### Structured / code generation & 4K long-context DSpark showcase (C=1, greedy, `--no-thinking`)
+### Structured / code generation & 4K–16K long-context DSpark showcase (C=1, greedy, `--no-thinking`)
 
 | Workload | Normal | DSpark-2 | DSpark-3 | DSpark-7 |
 |---|---:|---:|---:|---:|
-| Python dataclass refactor (256 tok, engine decode) | **128.47 tok/s** *(was 106.08, +21.1%)* | **168.90 tok/s** (`2.19` tok/rnd, 59.6%, `12.97 ms/rnd`) | **166.68 tok/s** (`2.41` tok/rnd, 46.9%, `14.46 ms/rnd`) | **145.32 tok/s** (`3.12` tok/rnd, 30.3%, `21.47 ms/rnd`) |
+| Python dataclass refactor (256 tok, engine decode) | **128.47 tok/s** *(was 106.08, +21.1%)* | **168.94 tok/s** (`2.25` tok/rnd, 62.4%) | **166.68 tok/s** (`2.41` tok/rnd, 46.9%, `14.46 ms/rnd`) | **145.32 tok/s** (`3.12` tok/rnd, 30.3%, `21.47 ms/rnd`) |
 | 4,274-tok needle retrieval (`--max-context 8192`) | **114.24 tok/s** *(was 83.00, +37.6%)* | — | **181.82 tok/s** (`3.10` tok/rnd, *was 139.77, +30.1%*) | — |
+| 16,304-tok long-context decode (`--max-context 20480`, 128 new) | **99.32 tok/s** *(was 95.92, +3.5%)* | — | **131.78 tok/s** (`2.65` tok/rnd, `20.11 ms/rnd`; *was 119.10 / `20.74 ms/rnd`*) | — |
 
 - Per-round decode latency dropped to **`7.78 ms/tok`** (Normal C=1), **`12.97 ms/rnd`** (DSpark-2), and **`14.46 ms/rnd`** (DSpark-3); high-acceptance prompts (`~3.0+ tok/rnd`) reach **182–205+ tok/s** decode while preserving lossless weights and exact greedy semantics.
 - Cold prefill non-regression spot-check (`512` and `~4,096` tok, C=1): TTFT `0.525 s / 4.679 s` (Normal) and `0.531 s / 4.673 s` (DSpark-3), matching or slightly improving on the full sweep below.
@@ -127,36 +130,45 @@ server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–6
 
 ## Key Volta `sm_70` optimizations
 
-- **Fused BF16 projections (`src/ops/inkling2/bf16_linear.cu`)**: coalesced 2-deep prefetched SIMT
-  kernels (`1rpw_pf2`, `16tpr_pf2`, `t9_16_16tpr_pf2`), 3-way (`Q/gate/R/sink + K + V`) and
-  global-layer 5-way (`+ k_sconv_proj + v_sconv_proj`) projection fusion, fused monotonic softcap
-  unembed argmax (`unembed_small_t_argmax_pf2`, reaching `883 GB/s` at `T=1`), and 4-row/warp
-  strided Markov logits argmax.
+- **Fused BF16 projections & direct BF16 unembed (`src/ops/inkling2/bf16_linear.cu`, `program.cpp`)**:
+  coalesced 2-deep prefetched SIMT kernels (`1rpw_pf2`, `16tpr_pf2`, `t9_16_16tpr_pf2`), 3-way
+  (`Q/gate/R/sink + K + V`) and global-layer 5-way (`+ k_sconv_proj + v_sconv_proj`) projection
+  fusion, fused monotonic softcap unembed argmax (`unembed_small_t_argmax_pf2`, reaching `883 GB/s`
+  at `T=1`), direct BF16 fused softcap+mask unembed epilogue (`unembed_bf16_{1rpw,small_t_16tpr}_pf2`,
+  eliminating FP32 logit HBM round-trips, 1-CTA softcap scan, and `cast_fp32_to_bf16`) captured inside
+  cross-device `decode_logits_graphs_` for non-greedy sampling, multi-CTA `softcap_mask_f32_kernel`,
+  and 4-row/warp strided Markov logits argmax.
 - **Zero-spill coalesced sparse MoE (`src/ops/inkling2/sparse_moe.cu`)**: single-wave 64-CTA
-  Last-CTA fused router (`moe_router_fused` with register-only `warp_select_top8_128`, fused FP16
-  input staging, and `accum_f32` zeroing), 2-deep prefetched `T=1` NVFP4/MXFP8 kernels, SMEM-staged
-  `TileM=4` grouped `w13` (`18 KB` SMEM, specialized `mc=1/2/3..4`, 2-deep prefetch), and
+  Last-CTA fused router (`moe_router_fused` with register-only `warp_select_top8_128`, free
+  Warps 1–3 `T=1` `x_staged` conversion overlapped with Warp 0 top-8 selection, and `T=2..8`
+  input staging + `accum_f32` zeroing), 2-deep prefetched `PreStaged` `T=1` NVFP4/MXFP8 kernels,
+  SMEM-staged `TileM=4` grouped `w13` (`18 KB` SMEM, specialized `mc=1/2/3..4`, 2-deep prefetch), and
   128-row/CTA grouped `w2` (`0 B` stack/spills verified via `ptxas -v` on every hot kernel).
 - **Fused TP2 packet-push AllReduce + ShortConv (`src/ops/inkling2/sconv.cu`)**: fuses TP2 direct
   P2P two-epoch packet reduction, optional FP32→BF16 cast from MoE `accum_f32`, `attn_sconv` /
   `mlp_sconv`, and residual/block update into a single kernel for **both** Decode (`T=1..8`) and
-  Verify (`V=2..8`), plus fused TP2 packet AllReduce + residual add for DSpark MTP layers.
+  Verify (`V=2..8`, row-major coalesced Phase 1, bank-conflict-free SMEM Phase 2, compile-time
+  `FixV` for `V=3,4,6,8`), plus fused TP2 packet AllReduce + residual add for DSpark MTP layers.
 - **Attention, loop-control, and DSpark fusion (`attention.cu`, `attn_res_control.cu`, `dspark.cu`)**:
   single-launch adaptive Last-CTA Q-head Split-KV for both main attention and DSpark block attention
-  (zero reduce launches, zero scratch at short context, cached global page lookups), K/V SConv fused
-  directly into `attn_prologue`, fused AttnRes + loop-control prep (`attn_res_mix_and_prep`,
+  (zero reduce launches, zero scratch at short context, cached global page lookups, and adaptive
+  1-`exp` warp-uniform online softmax on SFU-bound `T>=2` long-context global attention), K/V SConv
+  fused directly into `attn_prologue`, fused AttnRes + loop-control prep (`attn_res_mix_and_prep`,
   `attn_res_mix_pair_and_prep_qkv`, `swap_pass_banks`), batched 3-layer MTP context mix/KV-write,
   fused MTP final-norm/extract/zero, and zero-HBM-intermediate ping-pong `mtp_markov_rnn_step`.
 
 ## Verification and limitations
 
-- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **164/164 PASS** against
-  independent FP64 oracles, TP1/TP2 shard-equivalence, two-epoch packet loopback, long-context
-  adaptive Split-KV (`1,100–1,200` tokens across SWA ring wrap & permuted global pages), and fused
-  vs unfused parity checks, with **0 B stack / 0 spills** across all hot Volta kernels.
+- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **170/170 PASS** against
+  independent FP64 oracles, bit-exact direct-BF16 unembed & `T=1` PreStaged MoE checks, TP1/TP2
+  shard-equivalence, two-epoch packet loopback, long-context adaptive Split-KV (`1,100–1,200` tokens
+  across SWA ring wrap & permuted global pages), and fused vs unfused parity checks, with
+  **0 B stack / 0 spills** across all hot Volta kernels.
 - **Exact token parity vs PyTorch (`tools/reference/inkling2_mini/reference.py`)**: **32/32 exact
   token match** across `TP2 Graph Normal`, `TP2 Eager Normal`, `TP2 Graph DSpark-2`,
-  `TP2 Graph DSpark-3`, `TP2 Graph DSpark-5`, and `TP2 Graph DSpark-7`.
+  `TP2 Graph DSpark-3`, `TP2 Graph DSpark-5`, `TP2 Graph DSpark-7`, and the Graph-captured Direct
+  BF16 sampling path (`--temperature 0.01`), plus 48/48 bit-exact Graph == Eager stochastic
+  (`--temperature 0.7 --top-p 0.95 --seed 42`) determinism.
 - **Tokenizer parity vs HF `AutoTokenizer`**: exact prompt token count match (0 delta) across
   English contractions, Japanese, Python code, numbers/URLs, and special-character inputs.
 - **Long-context & concurrency**: verified exact needle retrieval at 4,184 prompt tokens

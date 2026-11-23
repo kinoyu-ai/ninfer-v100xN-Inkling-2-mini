@@ -844,6 +844,138 @@ __global__ void reduce_block_argmax_kernel(const float* __restrict__ block_vals,
     }
 }
 
+__device__ __forceinline__ __nv_bfloat16 apply_softcap_bf16(float raw, float softcap) {
+    const float val = (softcap > 0.0f) ? (softcap * tanhf(raw / softcap)) : raw;
+    return __float2bfloat16_rn(val);
+}
+
+// Fused T == 1 Unembed + Softcap + Valid-Cols Mask -> BF16 (exact bf16_gemv_1rpw_pf2 dot order!)
+// Eliminates FP32 [100512, 1] HBM round-trip, 1-CTA softcap scan, and cast_fp32_to_bf16!
+__global__ __launch_bounds__(128, 8) void unembed_bf16_1rpw_pf2_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ out, int n, int k, float softcap, int valid_cols) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row  = blockIdx.x * 4 + warp;
+    if (row >= n) { return; }
+    if (row >= valid_cols) {
+        if (lane == 0) { out[row] = __float2bfloat16_rn(-std::numeric_limits<float>::infinity()); }
+        return;
+    }
+
+    const int k8    = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    const uint4* xp = reinterpret_cast<const uint4*>(x);
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (lane < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + lane);
+        uint4 x_cur = __ldg(xp + lane);
+        for (int i = lane; i < k8; i += 32) {
+            uint4 w_nxt{}, x_nxt{};
+            if (i + 32 < k8) {
+                w_nxt = ld_global_cg_u4(wp + i + 32);
+                x_nxt = __ldg(xp + i + 32);
+            }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&x_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]), x0 = __bfloat1622float2(xb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]), x1 = __bfloat1622float2(xb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]), x2 = __bfloat1622float2(xb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]), x3 = __bfloat1622float2(xb[3]);
+            a0 = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, a0));
+            a1 = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, a1));
+            a2 = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, a2));
+            a3 = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, a3));
+            w_cur = w_nxt;
+            x_cur = x_nxt;
+        }
+    }
+
+    const float sum = warp_reduce_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) { out[row] = apply_softcap_bf16(sum, softcap); }
+}
+
+// Fused Small-T (T = 2..8) Unembed + Softcap + Valid-Cols Mask -> BF16 (exact 16tpr_pf2 dot order!)
+template <int ActiveT>
+__global__ __launch_bounds__(128, 6) void unembed_bf16_small_t_16tpr_pf2_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w,
+    __nv_bfloat16* __restrict__ out, int n, int k, float softcap, int valid_cols) {
+    const int r_loc = threadIdx.x >> 4; // 0..7
+    const int kl    = threadIdx.x & 15; // 0..15
+    const int row   = blockIdx.x * 8 + r_loc;
+    if (row >= n) { return; }
+    if (row >= valid_cols) {
+        if (kl == 0) {
+            const __nv_bfloat16 neg_inf =
+                __float2bfloat16_rn(-std::numeric_limits<float>::infinity());
+#pragma unroll
+            for (int ti = 0; ti < ActiveT; ++ti) {
+                out[static_cast<std::int64_t>(ti) * n + row] = neg_inf;
+            }
+        }
+        return;
+    }
+
+    const int k8       = k >> 3;
+    const uint4* wp    = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    float acc[ActiveT] = {};
+
+    if (kl < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + kl);
+        for (int i = kl; i < k8; i += 16) {
+            uint4 w_nxt{};
+            if (i + 16 < k8) { w_nxt = ld_global_cg_u4(wp + i + 16); }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]);
+#pragma unroll
+            for (int ti = 0; ti < ActiveT; ++ti) {
+                const uint4 xv = __ldg(reinterpret_cast<const uint4*>(
+                    x + static_cast<std::int64_t>(ti) * k) + i);
+                const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&xv);
+                const float2 x0 = __bfloat1622float2(xb[0]);
+                const float2 x1 = __bfloat1622float2(xb[1]);
+                const float2 x2 = __bfloat1622float2(xb[2]);
+                const float2 x3 = __bfloat1622float2(xb[3]);
+                acc[ti] = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, acc[ti]));
+                acc[ti] = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, acc[ti]));
+                acc[ti] = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, acc[ti]));
+                acc[ti] = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, acc[ti]));
+            }
+            w_cur = w_nxt;
+        }
+    }
+
+#pragma unroll
+    for (int ti = 0; ti < ActiveT; ++ti) {
+        float sum = acc[ti];
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 8, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 4, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 2, 16);
+        sum += __shfl_xor_sync(0xFFFFFFFFu, sum, 1, 16);
+        if (kl == 0) {
+            out[static_cast<std::int64_t>(ti) * n + row] = apply_softcap_bf16(sum, softcap);
+        }
+    }
+}
+
+// Multi-CTA softcap + mask for FP32 logits when no argmax is needed (replaces 1-CTA bottleneck!)
+__global__ void softcap_mask_f32_kernel(float* __restrict__ logits, int n, int t, float softcap,
+                                        int valid_cols) {
+    const int col = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+    const int row = static_cast<int>(blockIdx.y);
+    if (row >= t || col >= n) { return; }
+    float* lrow = logits + static_cast<std::int64_t>(row) * n;
+    if (col < valid_cols) {
+        if (softcap > 0.0f) { lrow[col] = softcap * tanhf(lrow[col] / softcap); }
+    } else {
+        lrow[col] = -std::numeric_limits<float>::infinity();
+    }
+}
+
 __global__ void softcap_mask_argmax_f32_kernel(float* __restrict__ logits, int n, int t,
                                                float softcap, int valid_cols,
                                                float* __restrict__ out_vals,
@@ -1814,14 +1946,59 @@ void inkling2_unembed_project(const Tensor& x, const Tensor& w, float softcap,
         return;
     }
 
-    if (logits_out == nullptr || logits_out->dtype != DType::FP32) {
-        throw std::invalid_argument("inkling2_unembed_project: requires FP32 logits_out or argmax outputs");
+    if (logits_out == nullptr) {
+        throw std::invalid_argument(
+            "inkling2_unembed_project: requires FP32/BF16 logits_out or argmax outputs");
+    }
+
+    // Fast fused BF16 logits path (NO FP32 HBM round-trip, NO 1-CTA softcap scan, NO separate cast!)
+    if (logits_out->dtype == DType::BF16) {
+        if (max_vals != nullptr || max_ids != nullptr) {
+            throw std::invalid_argument(
+                "inkling2_unembed_project: BF16 logits_out does not combine with argmax outputs");
+        }
+        if (logits_out->ne[0] != n || logits_out->ne[1] != t || (k & 7) != 0 || k < 8) {
+            throw std::invalid_argument("inkling2_unembed_project: invalid BF16 logits_out shape");
+        }
+        auto* out_bf16 = static_cast<__nv_bfloat16*>(logits_out->data);
+        for (int t0 = 0; t0 < t; t0 += 8) {
+            const int tb     = std::min(8, t - t0);
+            const auto* xsub = xp + static_cast<std::int64_t>(t0) * k;
+            auto* osub       = out_bf16 + static_cast<std::int64_t>(t0) * n;
+            if (tb == 1) {
+                unembed_bf16_1rpw_pf2_kernel<<<(n + 3) / 4, 128, 0, stream>>>(
+                    xsub, wp, osub, n, k, softcap, valid);
+            } else {
+                const int blocks = (n + 7) / 8;
+                switch (tb) {
+                case 2: unembed_bf16_small_t_16tpr_pf2_kernel<2><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 3: unembed_bf16_small_t_16tpr_pf2_kernel<3><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 4: unembed_bf16_small_t_16tpr_pf2_kernel<4><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 5: unembed_bf16_small_t_16tpr_pf2_kernel<5><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 6: unembed_bf16_small_t_16tpr_pf2_kernel<6><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 7: unembed_bf16_small_t_16tpr_pf2_kernel<7><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                case 8: unembed_bf16_small_t_16tpr_pf2_kernel<8><<<blocks, 128, 0, stream>>>(xsub, wp, osub, n, k, softcap, valid); break;
+                }
+            }
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return;
+    }
+
+    if (logits_out->dtype != DType::FP32) {
+        throw std::invalid_argument(
+            "inkling2_unembed_project: requires FP32/BF16 logits_out or argmax outputs");
     }
     dispatch_bf16_linear<float>(xp, wp, static_cast<float*>(logits_out->data), nullptr, nullptr, n, k, t, stream);
-    softcap_mask_argmax_f32_kernel<<<t, 256, 0, stream>>>(
-        static_cast<float*>(logits_out->data), n, t, softcap, valid,
-        max_vals ? static_cast<float*>(max_vals->data) : nullptr,
-        max_ids ? static_cast<std::int32_t*>(max_ids->data) : nullptr);
+    if (max_vals == nullptr && max_ids == nullptr) {
+        softcap_mask_f32_kernel<<<dim3((n + 255) / 256, t), 256, 0, stream>>>(
+            static_cast<float*>(logits_out->data), n, t, softcap, valid);
+    } else {
+        softcap_mask_argmax_f32_kernel<<<t, 256, 0, stream>>>(
+            static_cast<float*>(logits_out->data), n, t, softcap, valid,
+            max_vals ? static_cast<float*>(max_vals->data) : nullptr,
+            max_ids ? static_cast<std::int32_t*>(max_ids->data) : nullptr);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

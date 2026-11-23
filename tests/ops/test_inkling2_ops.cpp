@@ -74,6 +74,7 @@ struct DevBuf {
     template <typename T>
     void upload(const std::vector<T>& v) {
         CUDA_CHECK(cudaMemcpy(ptr, v.data(), v.size() * sizeof(T), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaStreamSynchronize(nullptr));
     }
     template <typename T>
     std::vector<T> download(std::size_t count) const {
@@ -446,6 +447,57 @@ void test_bf16_linear_and_heads(cudaStream_t stream) {
             }
         }
         std::printf("  [PASS] unembed_project argmax-only T=%d (pf2)\n", t);
+    }
+
+    // Wave 5: direct BF16 unembed_project (T=1, 4, 8, 12) bit-exact vs FP32 softcap_mask + round-to-BF16
+    for (int t : {1, 4, 8, 12}) {
+        const int n = 4096, k = 256, valid = 4000;
+        const float softcap = 30.0f;
+        auto hx = rand_bf16(rng, t * k, 0.5f);
+        auto hw = rand_bf16(rng, n * k, 0.5f);
+        DevBuf dx(hx.size() * 2), dw(hw.size() * 2), df32(t * n * 4), dbf16(t * n * 2);
+        dx.upload(hx); dw.upload(hw);
+        Tensor tx    = make_t(dx.ptr, DType::BF16, k, t);
+        Tensor tw    = make_t(dw.ptr, DType::BF16, k, n);
+        Tensor t_f32 = make_t(df32.ptr, DType::FP32, n, t);
+        Tensor t_b16 = make_t(dbf16.ptr, DType::BF16, n, t);
+
+        // Exercises multi-CTA softcap_mask_f32_kernel (no argmax) and fused direct-BF16 unembed!
+        ops::inkling2_unembed_project(tx, tw, softcap, valid, &t_f32, nullptr, nullptr, stream);
+        ops::inkling2_unembed_project(tx, tw, softcap, valid, &t_b16, nullptr, nullptr, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        auto gf32 = df32.download<float>(t * n);
+        auto gb16 = dbf16.download<std::uint16_t>(t * n);
+        int bit_diffs = 0;
+        for (int row = 0; row < t; ++row) {
+            for (int col = 0; col < n; ++col) {
+                const std::size_t idx = static_cast<std::size_t>(row) * n + col;
+                if (col >= valid) {
+                    if (!std::isinf(gf32[idx]) || gf32[idx] > 0.0f || gb16[idx] != 0xFF80u) {
+                        throw std::runtime_error("unembed BF16/FP32 invalid col not masked to -inf");
+                    }
+                } else {
+                    const std::uint16_t want = f32_to_bf16(gf32[idx]);
+                    if (t <= 8) {
+                        if (gb16[idx] != want) {
+                            if (bit_diffs < 5) {
+                                std::fprintf(stderr,
+                                             "  [DIFF] T=%d row=%d col=%d f32=%.9g want=0x%04x got=0x%04x\n",
+                                             t, row, col, gf32[idx], want, gb16[idx]);
+                            }
+                            ++bit_diffs;
+                        }
+                    } else if (std::abs(bf16_to_f32(gb16[idx]) - gf32[idx]) > 4e-2f) {
+                        throw std::runtime_error("unembed BF16 T>8 value mismatch");
+                    }
+                }
+            }
+        }
+        if (bit_diffs != 0) {
+            throw std::runtime_error("unembed direct BF16 bit_diffs != 0 vs FP32+round");
+        }
+        std::printf("  [PASS] unembed_project direct BF16 T=%d (bit-exact vs FP32+round)\n", t);
     }
 }
 
@@ -1739,8 +1791,8 @@ void test_sparse_moe(cudaStream_t stream) {
             check_close(lbl2, gtp1, gtp2, 0.08, 0.02);
         }
 
-        // Wave 3/4.5: router_fused(prep_mode=1) + skip_prep=true across T=4, 8 (forces mc=1,2,3,4!)
-        for (int T : {4, 8}) {
+        // Wave 3/4.5/5: router_fused(prep_mode=1) + skip_prep=true across T=1, 4, 8
+        for (int T : {1, 4, 8}) {
             auto hx  = rand_bf16(rng, T * H, 0.3f);
             auto hrw = rand_bf16(rng, E * H, 0.05f);
             // Bias experts 0..11 strongly so multiple tokens collide on the same experts (mc=3, 4)!
@@ -1770,9 +1822,16 @@ void test_sparse_moe(cudaStream_t stream) {
                                             sc, tof, stream, true, false);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             char lbl[96];
-            std::snprintf(lbl, sizeof(lbl), "moe_nvfp4 router_fused(prep=1)+TileM4 T=%d", T);
-            check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
-                        to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+            std::snprintf(lbl, sizeof(lbl), "moe_nvfp4 router_fused(prep=1)+skip_prep T=%d", T);
+            if (T == 1) {
+                if (dout_ref.download<std::uint16_t>(H) != dout_fus.download<std::uint16_t>(H)) {
+                    throw std::runtime_error("moe_nvfp4 T=1 router_fused(prep=1)+PreStaged bit mismatch");
+                }
+                std::printf("  [PASS] %s (bit-exact)\n", lbl);
+            } else {
+                check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
+                            to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+            }
         }
     }
 
@@ -1890,8 +1949,8 @@ void test_sparse_moe(cudaStream_t stream) {
             check_close(lbl2, gtp1, gtp2, 0.05, 0.02);
         }
 
-        // Wave 3/4.5: router_fused(prep_mode=2) + skip_prep=true across T=4, 8 (SMEM w13 + 128r w2, mc=1..4!)
-        for (int T : {4, 8}) {
+        // Wave 3/4.5/5: router_fused(prep_mode=2) + skip_prep=true across T=1, 4, 8
+        for (int T : {1, 4, 8}) {
             auto hx  = rand_bf16(rng, T * H, 0.3f);
             auto hrw = rand_bf16(rng, E * H, 0.05f);
             std::vector<float> hrb(E, -20.0f);
@@ -1912,9 +1971,16 @@ void test_sparse_moe(cudaStream_t stream) {
                                             25.0f, sc, tof, stream, true, false);
             CUDA_CHECK(cudaStreamSynchronize(stream));
             char lbl[96];
-            std::snprintf(lbl, sizeof(lbl), "moe_mxfp8 router_fused(prep=2)+128r T=%d", T);
-            check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
-                        to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+            std::snprintf(lbl, sizeof(lbl), "moe_mxfp8 router_fused(prep=2)+skip_prep T=%d", T);
+            if (T == 1) {
+                if (dout_ref.download<std::uint16_t>(H) != dout_fus.download<std::uint16_t>(H)) {
+                    throw std::runtime_error("moe_mxfp8 T=1 router_fused(prep=2)+PreStaged bit mismatch");
+                }
+                std::printf("  [PASS] %s (bit-exact)\n", lbl);
+            } else {
+                check_close(lbl, to_f64_from_bf16(dout_ref.download<std::uint16_t>(T * H)),
+                            to_f64_from_bf16(dout_fus.download<std::uint16_t>(T * H)), 1e-2, 1e-2);
+            }
         }
     }
 }
