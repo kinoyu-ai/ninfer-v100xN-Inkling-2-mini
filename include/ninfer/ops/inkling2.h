@@ -273,6 +273,38 @@ void inkling2_tp2_packet_allreduce_residual(
     const Tensor& partial_in, void* local_storage, void* peer_storage, std::size_t epoch_bytes,
     Tensor& residual_inout, cudaStream_t stream);
 
+// Dedicated zero-barrier per-pack (288-CTA) TP2 direct-P2P Packet AllReduce + static SConv
+// arguments for T == 1 decode projection epilogues (o_proj and MoE w2).
+// Buffer layout per rank: [2 * 288] Bf16x8Pack (initialized to 0xFF) + [288] unsigned epochs (=0)
+// = 10,368 bytes total. Must only be used when the corresponding `inkling2_can_fuse_tp2_ar_sconv_*`
+// occupancy query confirms >= 288 co-resident CTAs on BOTH ranks (guarantees deadlock freedom).
+struct Inkling2Tp2ArSconvArgs {
+    void* pkt_local              = nullptr;
+    void* pkt_peer               = nullptr;
+    const void* sconv_weight     = nullptr; // BF16 [4, 2304]
+    float* state_pool            = nullptr; // FP32 state_base + layer_sconv_off
+    const std::int32_t* lane_ids = nullptr; // I32 [1]
+    std::size_t lane_stride      = 0;       // lane_sconv_floats
+    const void* residual_add     = nullptr; // optional BF16 [2304]
+    const void* block_copy_src   = nullptr; // optional BF16 [2304]
+    void* block_copy_dst         = nullptr; // optional BF16 [2304]
+};
+
+constexpr std::size_t kInkling2FusedTp2PktPayloadBytes = 2ULL * 288ULL * 16ULL; // 9,216 B
+constexpr std::size_t kInkling2FusedTp2PktEpochBytes   = 288ULL * 4ULL;         // 1,152 B
+constexpr std::size_t kInkling2FusedTp2PktTotalBytes =
+    kInkling2FusedTp2PktPayloadBytes + kInkling2FusedTp2PktEpochBytes; // 10,368 B
+
+// Query whether `device` can hold all 288 CTAs co-resident (deadlock-free) for fused T==1 AR+SConv.
+bool inkling2_can_fuse_tp2_ar_sconv_t1_oproj(int device);
+bool inkling2_can_fuse_tp2_ar_sconv_t1_moe(int device);
+
+// Fused T == 1 BF16 row-parallel linear (N=2304, K%8==0) + TP2 Packet AllReduce + static SConv
+// (+ optional residual_add / block_copy) in ONE zero-barrier 288-CTA launch!
+void inkling2_bf16_linear_tp2_ar_sconv_t1(const Tensor& x, const Tensor& w,
+                                          const Inkling2Tp2ArSconvArgs& ar, Tensor& out,
+                                          cudaStream_t stream);
+
 // ---------------------------------------------------------------------------
 // 4. Inkling-2 Attention (L2Clip + Tau + RelBias + KV Append + SWA/Full Sink GQA)
 // ---------------------------------------------------------------------------
@@ -407,13 +439,15 @@ void inkling2_attn_res_loop_ctrl_moe_router_fused(
 // w2_codes:  U8 [num_slabs, 128, 2304, 288],  w2_scales:  FP8_E4M3 [num_slabs, 128, 2304, 36]
 // skip_prep: true when inkling2_moe_router_fused already ran prep_mode=1.
 // skip_cast_out: true when caller consumes scratch.accum_f32 directly (e.g. fused TP2 AR+SConv).
+// fused_ar: optional T==1 TP2 direct-P2P AR + static SConv epilogue fused directly into w2!
 void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const void* w13_scales,
                                 const float* w13_amax, const float* w13_denom,
                                 const void* w2_codes, const void* w2_scales,
                                 const float* w2_amax, const float* w2_denom,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
                                 Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
-                                bool skip_prep = false, bool skip_cast_out = false);
+                                bool skip_prep = false, bool skip_cast_out = false,
+                                const Inkling2Tp2ArSconvArgs* fused_ar = nullptr);
 
 // MXFP8 MoE (layers 20..23): num_slabs = 1 (TP2) or 2 (TP1).
 // w13_codes: FP8_E4M3 [num_slabs, 128, 1152, 2304], w13_scales: U8 [num_slabs, 128, 1152, 72]
@@ -422,7 +456,8 @@ void inkling2_moe_mxfp8_forward(const Tensor& x, const void* w13_codes, const vo
                                 const void* w2_codes, const void* w2_scales,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
                                 Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
-                                bool skip_prep = false, bool skip_cast_out = false);
+                                bool skip_prep = false, bool skip_cast_out = false,
+                                const Inkling2Tp2ArSconvArgs* fused_ar = nullptr);
 
 // ---------------------------------------------------------------------------
 // 6. DSpark MTP Drafter Ops

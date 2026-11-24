@@ -158,6 +158,7 @@ struct WorkspaceRegions {
     TensorRegion logits_shard_f32;
     TensorRegion logits_shard_bf16;
     TensorRegion logits_full_bf16;
+    TensorRegion fused_tp2_pkt;
 
     // DSpark MTP scratch
     TensorRegion mtp_target_caps; // [H, 4, max_T]
@@ -356,6 +357,11 @@ WorkspaceRegions build_workspace_regions(const SequenceLayoutSpec& spec) {
     w.logits_shard_f32  = b.add_tensor(DType::FP32, {vrows, max_dec_T}, 256, "logits_shard_f32");
     w.logits_shard_bf16 = b.add_tensor(DType::BF16, {vrows, B}, 256, "logits_shard_bf16");
     w.logits_full_bf16  = b.add_tensor(DType::BF16, {kPaddedVocabSize, B}, 256, "logits_full_bf16");
+    if (spec.tp == 2) {
+        w.fused_tp2_pkt = b.add_tensor(
+            DType::U8, {static_cast<std::int32_t>(ops::kInkling2FusedTp2PktTotalBytes)}, 256,
+            "fused_tp2_pkt");
+    }
 
     if (spec.mtp_enabled) {
         const std::int32_t blk_T = B * kMtpMaxBlockSize;
@@ -483,6 +489,7 @@ struct RankState {
     ops::Inkling2MoeScratch moe_sc{};
     Tensor moe_router_logits, moe_inter_bf16;
     Tensor logits_shard_f32, logits_shard_bf16, logits_full_bf16;
+    Tensor fused_tp2_pkt;
 
     // MTP workspace
     Tensor mtp_target_caps, mtp_ctx_h, mtp_kv_ctx, mtp_h, mtp_norm, mtp_qkv, mtp_q, mtp_kb, mtp_vb,
@@ -615,6 +622,15 @@ public:
             rs.logits_shard_f32  = wr.logits_shard_f32.bind(w_span);
             rs.logits_shard_bf16 = wr.logits_shard_bf16.bind(w_span);
             rs.logits_full_bf16  = wr.logits_full_bf16.bind(w_span);
+            if (tp_ == 2) {
+                rs.fused_tp2_pkt = wr.fused_tp2_pkt.bind(w_span);
+                CUDA_CHECK(cudaMemsetAsync(rs.fused_tp2_pkt.data, 0xff,
+                                           ops::kInkling2FusedTp2PktPayloadBytes, rs.dev->stream));
+                CUDA_CHECK(cudaMemsetAsync(
+                    static_cast<std::uint8_t*>(rs.fused_tp2_pkt.data) +
+                        ops::kInkling2FusedTp2PktPayloadBytes,
+                    0, ops::kInkling2FusedTp2PktEpochBytes, rs.dev->stream));
+            }
 
             // Build pre-rearranged cross-pass query blocks [4, 2304] per core layer (idx 0..11)
             const std::size_t q_bytes = static_cast<std::size_t>(kHiddenSize) * sizeof(float);
@@ -682,6 +698,14 @@ public:
                 ops::inkling2_bf16_linear(b_in, rs.model->output_head, b_out, rs.dev->stream);
             }
             rs.dev->synchronize();
+        }
+        if (tp_ == 2 && peer_events_.has_value() && peer_events_->packet_storage(0) != nullptr) {
+            can_fuse_t1_oproj_ar_sconv_ =
+                ops::inkling2_can_fuse_tp2_ar_sconv_t1_oproj(ranks_[0].dev->device) &&
+                ops::inkling2_can_fuse_tp2_ar_sconv_t1_oproj(ranks_[1].dev->device);
+            can_fuse_t1_moe_ar_sconv_ =
+                ops::inkling2_can_fuse_tp2_ar_sconv_t1_moe(ranks_[0].dev->device) &&
+                ops::inkling2_can_fuse_tp2_ar_sconv_t1_moe(ranks_[1].dev->device);
         }
         CUDA_CHECK(cudaSetDevice(ec_.primary().device));
     }
@@ -1334,6 +1358,28 @@ private:
             const std::size_t attn_off = v_off + 3 * kv_dim_loc;
             const std::size_t mlp_off  = attn_off + 3 * kHiddenSize;
 
+            const bool is_block_boundary = (ip % kAttnResBlockSize == 0);
+            const bool can_fuse_tp2_ar_sconv_decode =
+                (mode == ForwardMode::Decode && tp_ == 2 && peer_events_.has_value() &&
+                 peer_events_->packet_storage(0) != nullptr &&
+                 attn_pair[0].bytes() <= peer_events_->packet_capacity_bytes() &&
+                 (attn_pair[0].bytes() % 16 == 0));
+            const int verify_packs_per_cta = (q_per_lane >= 2) ? (64 / q_per_lane) : 1;
+            const std::size_t verify_epoch_bytes_need =
+                static_cast<std::size_t>((batch_size * (kHiddenSize / 8) + verify_packs_per_cta - 1) /
+                                         verify_packs_per_cta) *
+                64ULL * 16ULL;
+            const bool can_fuse_tp2_ar_sconv_verify =
+                (mode == ForwardMode::Verify && q_per_lane >= 2 && q_per_lane <= 8 && tp_ == 2 &&
+                 peer_events_.has_value() && peer_events_->packet_storage(0) != nullptr &&
+                 verify_epoch_bytes_need <= peer_events_->packet_capacity_bytes());
+            const bool can_fuse_tp2_ar_sconv =
+                can_fuse_tp2_ar_sconv_decode || can_fuse_tp2_ar_sconv_verify;
+            const bool fuse_t1_oproj_ar =
+                (can_fuse_tp2_ar_sconv_decode && T == 1 && can_fuse_t1_oproj_ar_sconv_);
+            const bool fuse_t1_moe_ar =
+                (can_fuse_tp2_ar_sconv_decode && T == 1 && can_fuse_t1_moe_ar_sconv_);
+
             // --- Part A: Pre-Attention (AttnRes, Cross-Pass Control, Input Norm, Projections, SConv, Attention, O-proj) ---
             for (int r = 0; r < tp_; ++r) {
                 auto& rs     = ranks_[static_cast<std::size_t>(r)];
@@ -1500,30 +1546,38 @@ private:
                         rs.attn_split_done);
                 }
 
-                // O projection (row-parallel)
-                ops::inkling2_bf16_linear(aval_t, lw.o_proj, attn_pair[r], s);
+                // O projection (row-parallel); fused directly with TP2 AR+SConv at T==1 when qualified
+                if (!fuse_t1_oproj_ar) {
+                    ops::inkling2_bf16_linear(aval_t, lw.o_proj, attn_pair[r], s);
+                }
             }
 
             // TP2 AllReduce + attn_sconv + block copy / residual (FUSED for BOTH Decode AND Verify!)
-            const bool is_block_boundary = (ip % kAttnResBlockSize == 0);
-            const bool can_fuse_tp2_ar_sconv_decode =
-                (mode == ForwardMode::Decode && tp_ == 2 && peer_events_.has_value() &&
-                 peer_events_->packet_storage(0) != nullptr &&
-                 attn_pair[0].bytes() <= peer_events_->packet_capacity_bytes() &&
-                 (attn_pair[0].bytes() % 16 == 0));
-            const int verify_packs_per_cta = (q_per_lane >= 2) ? (64 / q_per_lane) : 1;
-            const std::size_t verify_epoch_bytes_need =
-                static_cast<std::size_t>((batch_size * (kHiddenSize / 8) + verify_packs_per_cta - 1) /
-                                         verify_packs_per_cta) *
-                64ULL * 16ULL;
-            const bool can_fuse_tp2_ar_sconv_verify =
-                (mode == ForwardMode::Verify && q_per_lane >= 2 && q_per_lane <= 8 && tp_ == 2 &&
-                 peer_events_.has_value() && peer_events_->packet_storage(0) != nullptr &&
-                 verify_epoch_bytes_need <= peer_events_->packet_capacity_bytes());
-            const bool can_fuse_tp2_ar_sconv =
-                can_fuse_tp2_ar_sconv_decode || can_fuse_tp2_ar_sconv_verify;
-
-            if (can_fuse_tp2_ar_sconv_decode) {
+            if (fuse_t1_oproj_ar) {
+                for (int r = 0; r < 2; ++r) {
+                    auto& rs       = ranks_[static_cast<std::size_t>(r)];
+                    const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
+                    CUDA_CHECK(cudaSetDevice(rs.dev->device));
+                    const std::int32_t q_n = rs.model->num_q_heads * kHeadDim;
+                    Tensor aval_t          = slice_t(rs.attn_val, q_n);
+                    Tensor ffn_t           = slice_t(rs.ffn_inp, kHiddenSize);
+                    ops::Inkling2Tp2ArSconvArgs ar{};
+                    ar.pkt_local    = rs.fused_tp2_pkt.data;
+                    ar.pkt_peer     = ranks_[static_cast<std::size_t>(1 - r)].fused_tp2_pkt.data;
+                    ar.sconv_weight = lw.attn_sconv.data;
+                    ar.state_pool   = static_cast<float*>(rs.sconv_state.data) + attn_off;
+                    ar.lane_ids     = static_cast<const std::int32_t*>(rs.round_batch_lanes.data);
+                    ar.lane_stride  = lane_sconv_stride;
+                    if (is_block_boundary) {
+                        ar.block_copy_src = cur_pair[r].data;
+                        ar.block_copy_dst = rs.blocks[static_cast<std::size_t>(num_blocks)].data;
+                    } else {
+                        ar.residual_add = cur_pair[r].data;
+                    }
+                    ops::inkling2_bf16_linear_tp2_ar_sconv_t1(aval_t, lw.o_proj, ar, ffn_t,
+                                                              rs.dev->stream);
+                }
+            } else if (can_fuse_tp2_ar_sconv_decode) {
                 for (int r = 0; r < 2; ++r) {
                     auto& rs       = ranks_[static_cast<std::size_t>(r)];
                     const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
@@ -1634,23 +1688,41 @@ private:
                 }
 
                 // Sparse MoE (NVFP4 layers 0..19, MXFP8 layers 20..23)
+                // At T==1 on qualified TP2 SM70, fuses w2 directly with TP2 AR + mlp_sconv + residual!
+                ops::Inkling2Tp2ArSconvArgs moe_ar{};
+                const ops::Inkling2Tp2ArSconvArgs* moe_ar_ptr = nullptr;
+                Tensor& moe_dst                               = fuse_t1_moe_ar ? cur_pair[r] : moe_pair[r];
+                if (fuse_t1_moe_ar) {
+                    moe_ar.pkt_local    = rs.fused_tp2_pkt.data;
+                    moe_ar.pkt_peer     = ranks_[static_cast<std::size_t>(1 - r)].fused_tp2_pkt.data;
+                    moe_ar.sconv_weight = lw.mlp_sconv.data;
+                    moe_ar.state_pool   = sconv_base + mlp_off;
+                    moe_ar.lane_ids     = batch_lanes;
+                    moe_ar.lane_stride  = lane_sconv_stride;
+                    moe_ar.residual_add = ffn_t.data;
+                    moe_ar_ptr          = &moe_ar;
+                }
                 if (lw.is_nvfp4) {
                     ops::inkling2_moe_nvfp4_forward(mlp_t, lw.w13_codes, lw.w13_scales, lw.w13_amax,
                                                     lw.w13_denom, lw.w2_codes, lw.w2_scales,
                                                     lw.w2_amax, lw.w2_denom, rs.model->moe_slabs,
                                                     kMlpGateSoftcap, kMlpUpSoftcap, rs.moe_sc,
-                                                    moe_pair[r], s, fuse_moe_prep, fuse_moe_cast);
+                                                    moe_dst, s, fuse_moe_prep, fuse_moe_cast,
+                                                    moe_ar_ptr);
                 } else {
                     ops::inkling2_moe_mxfp8_forward(mlp_t, lw.w13_codes, lw.w13_scales, lw.w2_codes,
                                                     lw.w2_scales, rs.model->moe_slabs,
                                                     kMlpGateSoftcap, kMlpUpSoftcap, rs.moe_sc,
-                                                    moe_pair[r], s, fuse_moe_prep, fuse_moe_cast);
+                                                    moe_dst, s, fuse_moe_prep, fuse_moe_cast,
+                                                    moe_ar_ptr);
                 }
             }
             if (is_block_boundary) { ++num_blocks; }
 
             // TP2 AllReduce + mlp_sconv + fused residual add with ffn_inp -> cur (FUSED for Decode & Verify!)
-            if (can_fuse_tp2_ar_sconv_decode) {
+            if (fuse_t1_moe_ar) {
+                // Already fused directly into MoE w2 epilogue above!
+            } else if (can_fuse_tp2_ar_sconv_decode) {
                 for (int r = 0; r < 2; ++r) {
                     auto& rs       = ranks_[static_cast<std::size_t>(r)];
                     const auto& lw = rs.model->layers[static_cast<std::size_t>(ip)];
@@ -2477,9 +2549,11 @@ private:
     std::uint32_t max_concurrency_ = 1;
     std::uint32_t max_context_    = 2048;
     std::uint32_t prefill_chunk_  = 1024;
-    bool mtp_enabled_             = false;
-    std::uint32_t draft_tokens_   = 0;
-    bool use_cuda_graph_          = true;
+    bool mtp_enabled_                 = false;
+    std::uint32_t draft_tokens_       = 0;
+    bool use_cuda_graph_              = true;
+    bool can_fuse_t1_oproj_ar_sconv_  = false;
+    bool can_fuse_t1_moe_ar_sconv_    = false;
 
     std::optional<ops::PeerEvents> peer_events_;
     std::optional<DecodeGraphPeerBridge> peer_bridge_;

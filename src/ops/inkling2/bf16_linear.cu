@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
+#include "ops/inkling2/tp2_packet_epilogue.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -99,6 +100,64 @@ __global__ __launch_bounds__(128, 8) void bf16_gemv_1rpw_pf2_kernel(
         } else {
             out[row] = sum;
         }
+    }
+}
+
+// Fused T == 1 BF16 row-parallel GEMV (N = 2304, 8 warps/CTA = 1 row/warp -> 288 CTAs = 1 CTA/pack)
+// + TP2 direct-P2P Packet AllReduce + static SConv (+ optional residual_add / block_copy).
+// Exact same 32-thread warp reduction order as bf16_gemv_1rpw_pf2_kernel -> 100% bit-exact!
+__global__ __launch_bounds__(256, 4) void bf16_oproj_tp2_ar_sconv_t1_kernel(
+    const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ w, int k,
+    void* __restrict__ pkt_local, void* __restrict__ pkt_peer,
+    const __nv_bfloat16* __restrict__ sconv_w, float* __restrict__ state_pool,
+    const std::int32_t* __restrict__ lane_ids, std::size_t lane_stride,
+    __nv_bfloat16* __restrict__ out, const __nv_bfloat16* __restrict__ residual_add,
+    const void* __restrict__ block_copy_src, void* __restrict__ block_copy_dst) {
+    alignas(16) __shared__ __nv_bfloat16 s_local_bf16[8];
+    __shared__ detail::Tp2Bf16x8Pack s_peer_pack;
+
+    const int pack = static_cast<int>(blockIdx.x); // 0..287
+    const int warp = threadIdx.x >> 5;             // 0..7
+    const int lane = threadIdx.x & 31;
+    const int row  = pack * 8 + warp;
+
+    const int k8    = k >> 3;
+    const uint4* wp = reinterpret_cast<const uint4*>(w + static_cast<std::int64_t>(row) * k);
+    const uint4* xp = reinterpret_cast<const uint4*>(x);
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    if (lane < k8) {
+        uint4 w_cur = ld_global_cg_u4(wp + lane);
+        uint4 x_cur = __ldg(xp + lane);
+        for (int i = lane; i < k8; i += 32) {
+            uint4 w_nxt{}, x_nxt{};
+            if (i + 32 < k8) {
+                w_nxt = ld_global_cg_u4(wp + i + 32);
+                x_nxt = __ldg(xp + i + 32);
+            }
+            const auto* wb  = reinterpret_cast<const __nv_bfloat162*>(&w_cur);
+            const auto* xb  = reinterpret_cast<const __nv_bfloat162*>(&x_cur);
+            const float2 w0 = __bfloat1622float2(wb[0]), x0 = __bfloat1622float2(xb[0]);
+            const float2 w1 = __bfloat1622float2(wb[1]), x1 = __bfloat1622float2(xb[1]);
+            const float2 w2 = __bfloat1622float2(wb[2]), x2 = __bfloat1622float2(xb[2]);
+            const float2 w3 = __bfloat1622float2(wb[3]), x3 = __bfloat1622float2(xb[3]);
+            a0 = fmaf(w0.x, x0.x, fmaf(w0.y, x0.y, a0));
+            a1 = fmaf(w1.x, x1.x, fmaf(w1.y, x1.y, a1));
+            a2 = fmaf(w2.x, x2.x, fmaf(w2.y, x2.y, a2));
+            a3 = fmaf(w3.x, x3.x, fmaf(w3.y, x3.y, a3));
+            w_cur = w_nxt;
+            x_cur = x_nxt;
+        }
+    }
+
+    const float sum = warp_reduce_sum((a0 + a1) + (a2 + a3));
+    if (lane == 0) { s_local_bf16[warp] = __float2bfloat16_rn(sum); }
+    __syncthreads();
+
+    if (threadIdx.x < 8) {
+        detail::tp2_packet_ar_sconv_epilogue_w0(
+            pack, s_local_bf16, &s_peer_pack, pkt_local, pkt_peer, sconv_w, state_pool, lane_ids,
+            lane_stride, out, residual_add, block_copy_src, block_copy_dst);
     }
 }
 
@@ -1885,6 +1944,40 @@ void inkling2_bf16_linear_5way(const Tensor& x0, const Tensor& w0, Tensor& out0,
     }
     inkling2_bf16_linear_triple(x0, w0, out0, x1, w1, out1, x2, w2, out2, stream);
     inkling2_bf16_linear_pair(x3, w3, out3, x4, w4, out4, stream);
+}
+
+bool inkling2_can_fuse_tp2_ar_sconv_t1_oproj(int device) {
+    int prev = 0;
+    CUDA_CHECK(cudaGetDevice(&prev));
+    if (prev != device) { CUDA_CHECK(cudaSetDevice(device)); }
+    int sms = 0;
+    int bpm = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &bpm, bf16_oproj_tp2_ar_sconv_t1_kernel, 256, 0));
+    if (prev != device) { CUDA_CHECK(cudaSetDevice(prev)); }
+    return (bpm * sms) >= detail::kTp2FusedPacks;
+}
+
+void inkling2_bf16_linear_tp2_ar_sconv_t1(const Tensor& x, const Tensor& w,
+                                          const Inkling2Tp2ArSconvArgs& ar, Tensor& out,
+                                          cudaStream_t stream) {
+    const int k = x.ne[0];
+    const int t = x.ne[1];
+    const int n = w.ne[1];
+    if (t != 1 || n != detail::kTp2FusedHidden || (k & 7) != 0 || k <= 0 ||
+        x.dtype != DType::BF16 || w.dtype != DType::BF16 || out.dtype != DType::BF16 ||
+        w.ne[0] != k || out.ne[0] != n || out.ne[1] != 1 ||
+        ar.pkt_local == nullptr || ar.pkt_peer == nullptr || ar.sconv_weight == nullptr ||
+        ar.state_pool == nullptr || ar.lane_ids == nullptr) {
+        throw std::invalid_argument("inkling2_bf16_linear_tp2_ar_sconv_t1: invalid arguments");
+    }
+    bf16_oproj_tp2_ar_sconv_t1_kernel<<<detail::kTp2FusedPacks, 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(w.data), k,
+        ar.pkt_local, ar.pkt_peer, static_cast<const __nv_bfloat16*>(ar.sconv_weight),
+        ar.state_pool, ar.lane_ids, ar.lane_stride, static_cast<__nv_bfloat16*>(out.data),
+        static_cast<const __nv_bfloat16*>(ar.residual_add), ar.block_copy_src, ar.block_copy_dst);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void inkling2_unembed_project(const Tensor& x, const Tensor& w, float softcap,

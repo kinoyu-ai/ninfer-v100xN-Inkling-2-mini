@@ -3084,6 +3084,381 @@ void test_dspark_ops(cudaStream_t stream) {
     }
 }
 
+void test_tp2_fused_ar_sconv() {
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    if (count < 2) {
+        std::printf("  [SKIP] tp2_fused_ar_sconv (requires 2 GPUs)\n");
+        return;
+    }
+    int can01 = 0, can10 = 0;
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can01, 0, 1));
+    CUDA_CHECK(cudaDeviceCanAccessPeer(&can10, 1, 0));
+    if (!can01 || !can10 ||
+        !ops::inkling2_can_fuse_tp2_ar_sconv_t1_oproj(0) ||
+        !ops::inkling2_can_fuse_tp2_ar_sconv_t1_oproj(1) ||
+        !ops::inkling2_can_fuse_tp2_ar_sconv_t1_moe(0) ||
+        !ops::inkling2_can_fuse_tp2_ar_sconv_t1_moe(1)) {
+        std::printf("  [SKIP] tp2_fused_ar_sconv (P2P or 288-CTA residency unavailable)\n");
+        return;
+    }
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        cudaError_t e = cudaDeviceEnablePeerAccess(1 - r, 0);
+        if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) { CUDA_CHECK(e); }
+        (void)cudaGetLastError();
+    }
+
+    struct RankBuf {
+        int dev = 0;
+        void* p = nullptr;
+        RankBuf() = default;
+        RankBuf(int d, std::size_t n) : dev(d) {
+            CUDA_CHECK(cudaSetDevice(dev));
+            CUDA_CHECK(cudaMalloc(&p, n));
+        }
+        ~RankBuf() {
+            if (p) {
+                (void)cudaSetDevice(dev);
+                (void)cudaFree(p);
+            }
+        }
+        RankBuf(const RankBuf&) = delete;
+        RankBuf& operator=(const RankBuf&) = delete;
+        RankBuf(RankBuf&& o) noexcept : dev(o.dev), p(o.p) { o.p = nullptr; }
+        RankBuf& operator=(RankBuf&& o) noexcept {
+            if (this != &o) {
+                if (p) { (void)cudaSetDevice(dev); (void)cudaFree(p); }
+                dev = o.dev; p = o.p; o.p = nullptr;
+            }
+            return *this;
+        }
+    };
+
+    auto assert_u16_exact = [](const char* lbl, const std::vector<std::uint16_t>& a,
+                               const std::vector<std::uint16_t>& b) {
+        if (a.size() != b.size()) { throw std::runtime_error(std::string(lbl) + ": size"); }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i] != b[i]) {
+                throw std::runtime_error(std::string(lbl) + ": bit diff at " + std::to_string(i));
+            }
+        }
+        std::printf("  [PASS] %s (bit-exact %zu elems)\n", lbl, a.size());
+    };
+    auto assert_u32_exact = [](const char* lbl, const std::vector<std::uint32_t>& a,
+                               const std::vector<std::uint32_t>& b) {
+        if (a.size() != b.size()) { throw std::runtime_error(std::string(lbl) + ": size"); }
+        for (std::size_t i = 0; i < a.size(); ++i) {
+            if (a[i] != b[i]) {
+                throw std::runtime_error(std::string(lbl) + ": bit diff at " + std::to_string(i));
+            }
+        }
+        std::printf("  [PASS] %s (bit-exact %zu elems)\n", lbl, a.size());
+    };
+
+    constexpr int H = 2304, K = 1024, E = 128, I_slab = 576;
+    constexpr std::size_t kLaneStride = 3ULL * H;
+    constexpr std::size_t kBaseEpochBytes = 65536;
+
+    cudaStream_t st[2]{};
+    cudaEvent_t ev01 = nullptr, ev10 = nullptr;
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&st[r], cudaStreamNonBlocking));
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev01, cudaEventDisableTiming));
+    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaEventCreateWithFlags(&ev10, cudaEventDisableTiming));
+
+    std::mt19937 rng(20261124);
+    RankBuf pkt_base[2], pkt_fus[2], dx_o[2], dw_o[2], dsw[2], dres[2], dblk_s[2], dblk_db[2], dblk_df[2];
+    RankBuf dtmp[2], dout_b[2], dout_f[2], dst_b[2], dst_f[2], dlane[2];
+
+    for (int r = 0; r < 2; ++r) {
+        pkt_base[r] = RankBuf(r, 2 * kBaseEpochBytes + (kBaseEpochBytes / (16 * 64)) * sizeof(unsigned));
+        pkt_fus[r]  = RankBuf(r, ops::kInkling2FusedTp2PktTotalBytes);
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaMemset(pkt_base[r].p, 0xff, 2 * kBaseEpochBytes));
+        CUDA_CHECK(cudaMemset(static_cast<std::uint8_t*>(pkt_base[r].p) + 2 * kBaseEpochBytes, 0,
+                              (kBaseEpochBytes / (16 * 64)) * sizeof(unsigned)));
+        CUDA_CHECK(cudaMemset(pkt_fus[r].p, 0xff, ops::kInkling2FusedTp2PktPayloadBytes));
+        CUDA_CHECK(cudaMemset(
+            static_cast<std::uint8_t*>(pkt_fus[r].p) + ops::kInkling2FusedTp2PktPayloadBytes, 0,
+            ops::kInkling2FusedTp2PktEpochBytes));
+
+        dx_o[r] = RankBuf(r, K * 2); dw_o[r] = RankBuf(r, static_cast<std::size_t>(H) * K * 2);
+        dsw[r] = RankBuf(r, H * 4 * 2); dres[r] = RankBuf(r, H * 2);
+        dblk_s[r] = RankBuf(r, H * 2); dblk_db[r] = RankBuf(r, H * 2); dblk_df[r] = RankBuf(r, H * 2);
+        dtmp[r] = RankBuf(r, H * 2); dout_b[r] = RankBuf(r, H * 2); dout_f[r] = RankBuf(r, H * 2);
+        dst_b[r] = RankBuf(r, kLaneStride * 4); dst_f[r] = RankBuf(r, kLaneStride * 4);
+        dlane[r] = RankBuf(r, 4);
+        std::int32_t lane0 = 0;
+        CUDA_CHECK(cudaMemcpy(dlane[r].p, &lane0, 4, cudaMemcpyHostToDevice));
+        auto hw = rand_bf16(rng, static_cast<std::size_t>(H) * K, 0.08f);
+        auto hsw = rand_bf16(rng, H * 4, 0.25f);
+        auto hst = rand_f32(rng, kLaneStride, 0.5f);
+        CUDA_CHECK(cudaMemcpy(dw_o[r].p, hw.data(), hw.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dsw[r].p, hsw.data(), hsw.size() * 2, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst_b[r].p, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(dst_f[r].p, hst.data(), hst.size() * 4, cudaMemcpyHostToDevice));
+    }
+
+    // 1. o_proj + AR + attn_sconv: 2-GPU Peer-Capture CUDA Graph, 4 changed-input replays (residual & block_copy!)
+    for (int mode = 0; mode < 2; ++mode) {
+        const bool is_blk = (mode == 1);
+        cudaGraph_t g_f = nullptr;
+        cudaGraphExec_t e_f = nullptr;
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaStreamBeginCapture(st[0], cudaStreamCaptureModeRelaxed));
+        CUDA_CHECK(cudaEventRecord(ev01, st[0]));
+        CUDA_CHECK(cudaStreamWaitEvent(st[1], ev01, 0));
+        for (int r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            Tensor tx = make_t(dx_o[r].p, DType::BF16, K, 1);
+            Tensor tw = make_t(dw_o[r].p, DType::BF16, K, H);
+            Tensor to = make_t(dout_f[r].p, DType::BF16, H, 1);
+            ops::Inkling2Tp2ArSconvArgs ar{};
+            ar.pkt_local    = pkt_fus[r].p;
+            ar.pkt_peer     = pkt_fus[1 - r].p;
+            ar.sconv_weight = dsw[r].p;
+            ar.state_pool   = static_cast<float*>(dst_f[r].p);
+            ar.lane_ids     = static_cast<const std::int32_t*>(dlane[r].p);
+            ar.lane_stride  = kLaneStride;
+            if (is_blk) { ar.block_copy_src = dblk_s[r].p; ar.block_copy_dst = dblk_df[r].p; }
+            else { ar.residual_add = dres[r].p; }
+            ops::inkling2_bf16_linear_tp2_ar_sconv_t1(tx, tw, ar, to, st[r]);
+        }
+        CUDA_CHECK(cudaSetDevice(1));
+        CUDA_CHECK(cudaEventRecord(ev10, st[1]));
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaStreamWaitEvent(st[0], ev10, 0));
+        CUDA_CHECK(cudaStreamEndCapture(st[0], &g_f));
+        CUDA_CHECK(cudaGraphInstantiate(&e_f, g_f, nullptr, nullptr, 0));
+        CUDA_CHECK(cudaGraphUpload(e_f, st[0]));
+
+        for (int rep = 0; rep < 4; ++rep) {
+            for (int r = 0; r < 2; ++r) {
+                CUDA_CHECK(cudaSetDevice(r));
+                auto hx = rand_bf16(rng, K, 0.5f);
+                auto hres = rand_bf16(rng, H, 0.4f);
+                auto hblk = rand_bf16(rng, H, 0.4f);
+                CUDA_CHECK(cudaMemcpy(dx_o[r].p, hx.data(), K * 2, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(dres[r].p, hres.data(), H * 2, cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaMemcpy(dblk_s[r].p, hblk.data(), H * 2, cudaMemcpyHostToDevice));
+            }
+            for (int r = 0; r < 2; ++r) {
+                CUDA_CHECK(cudaSetDevice(r));
+                Tensor tx = make_t(dx_o[r].p, DType::BF16, K, 1);
+                Tensor tw = make_t(dw_o[r].p, DType::BF16, K, H);
+                Tensor tt = make_t(dtmp[r].p, DType::BF16, H, 1);
+                Tensor tsw = make_t(dsw[r].p, DType::BF16, 4, H);
+                Tensor to = make_t(dout_b[r].p, DType::BF16, H, 1);
+                Tensor tres = make_t(dres[r].p, DType::BF16, H, 1);
+                Tensor tbs = make_t(dblk_s[r].p, DType::BF16, H, 1);
+                Tensor tbd = make_t(dblk_db[r].p, DType::BF16, H, 1);
+                ops::inkling2_bf16_linear(tx, tw, tt, st[r]);
+                ops::inkling2_tp2_packet_allreduce_sconv_decode(
+                    tt, pkt_base[r].p, pkt_base[1 - r].p, kBaseEpochBytes, tsw,
+                    static_cast<float*>(dst_b[r].p), static_cast<const std::int32_t*>(dlane[r].p),
+                    1, kLaneStride, to, is_blk ? nullptr : &tres,
+                    is_blk ? &tbs : nullptr, is_blk ? &tbd : nullptr, st[r]);
+            }
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaGraphLaunch(e_f, st[0]));
+            for (int r = 0; r < 2; ++r) { CUDA_CHECK(cudaSetDevice(r)); CUDA_CHECK(cudaStreamSynchronize(st[r])); }
+        }
+        for (int r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            std::vector<std::uint16_t> ob(H), of(H), bb(H), bf(H);
+            std::vector<std::uint32_t> sb(kLaneStride), sf(kLaneStride);
+            CUDA_CHECK(cudaMemcpy(ob.data(), dout_b[r].p, H * 2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(of.data(), dout_f[r].p, H * 2, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sb.data(), dst_b[r].p, kLaneStride * 4, cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(sf.data(), dst_f[r].p, kLaneStride * 4, cudaMemcpyDeviceToHost));
+            char lbl[96];
+            std::snprintf(lbl, sizeof(lbl), "tp2_oproj_ar_sconv Graph 4x (blk=%d r=%d) out", mode, r);
+            assert_u16_exact(lbl, ob, of);
+            std::snprintf(lbl, sizeof(lbl), "tp2_oproj_ar_sconv Graph 4x (blk=%d r=%d) state", mode, r);
+            assert_u32_exact(lbl, sb, sf);
+            if (is_blk) {
+                CUDA_CHECK(cudaMemcpy(bb.data(), dblk_db[r].p, H * 2, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(bf.data(), dblk_df[r].p, H * 2, cudaMemcpyDeviceToHost));
+                std::snprintf(lbl, sizeof(lbl), "tp2_oproj_ar_sconv Graph 4x (blk=1 r=%d) copy", r);
+                assert_u16_exact(lbl, bb, bf);
+            }
+        }
+        CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaGraphExecDestroy(e_f));
+        CUDA_CHECK(cudaGraphDestroy(g_f));
+    }
+
+    // 2. NVFP4 & MXFP8 MoE w2 + AR + mlp_sconv (T==1, 2-GPU Peer-Capture Graph, 4x changed input!)
+    {
+        const std::size_t nv_w13c_sz = static_cast<std::size_t>(E) * 1152 * 1152;
+        const std::size_t nv_w13s_sz = static_cast<std::size_t>(E) * 1152 * 144;
+        const std::size_t nv_w2c_sz  = static_cast<std::size_t>(E) * H * 288;
+        const std::size_t nv_w2s_sz  = static_cast<std::size_t>(E) * H * 36;
+        const std::size_t mx_w13c_sz = static_cast<std::size_t>(E) * 1152 * 2304;
+        const std::size_t mx_w13s_sz = static_cast<std::size_t>(E) * 1152 * 72;
+        const std::size_t mx_w2c_sz  = static_cast<std::size_t>(E) * H * 576;
+        const std::size_t mx_w2s_sz  = static_cast<std::size_t>(E) * H * 18;
+
+        RankBuf dxm[2], dtids[2], dtw[2], dinter[2], dacc[2];
+        RankBuf d_nv13c[2], d_nv13s[2], d_nv13a[2], d_nv13d[2], d_nv2c[2], d_nv2s[2], d_nv2a[2], d_nv2d[2];
+        RankBuf d_mx13c[2], d_mx13s[2], d_mx2c[2], d_mx2s[2];
+        ops::Inkling2MoeScratch sc[2]{};
+
+        for (int r = 0; r < 2; ++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            ops::inkling2_ensure_moe_scratch(r, 16);
+            dxm[r] = RankBuf(r, H * 2); dtids[r] = RankBuf(r, 8 * 4); dtw[r] = RankBuf(r, 8 * 4);
+            dinter[r] = RankBuf(r, 8 * I_slab * 2); dacc[r] = RankBuf(r, H * 4);
+            sc[r].topk_ids = static_cast<std::int32_t*>(dtids[r].p);
+            sc[r].topk_weights = static_cast<float*>(dtw[r].p);
+            sc[r].intermediate_bf16 = dinter[r].p;
+            sc[r].accum_f32 = static_cast<float*>(dacc[r].p);
+
+            d_nv13c[r] = RankBuf(r, nv_w13c_sz); d_nv13s[r] = RankBuf(r, nv_w13s_sz);
+            d_nv13a[r] = RankBuf(r, E * 4);      d_nv13d[r] = RankBuf(r, 4);
+            d_nv2c[r]  = RankBuf(r, nv_w2c_sz);  d_nv2s[r]  = RankBuf(r, nv_w2s_sz);
+            d_nv2a[r]  = RankBuf(r, E * 4);      d_nv2d[r]  = RankBuf(r, 4);
+            d_mx13c[r] = RankBuf(r, mx_w13c_sz); d_mx13s[r] = RankBuf(r, mx_w13s_sz);
+            d_mx2c[r]  = RankBuf(r, mx_w2c_sz);  d_mx2s[r]  = RankBuf(r, mx_w2s_sz);
+
+            CUDA_CHECK(cudaMemset(d_nv13c[r].p, 0x25 + r * 7, nv_w13c_sz));
+            CUDA_CHECK(cudaMemset(d_nv13s[r].p, 0x34, nv_w13s_sz));
+            CUDA_CHECK(cudaMemset(d_nv2c[r].p, 0x31 + r * 5, nv_w2c_sz));
+            CUDA_CHECK(cudaMemset(d_nv2s[r].p, 0x32, nv_w2s_sz));
+            std::vector<float> ha(E, 0.12f + 0.03f * r); float hd = 448.0f * 6.0f;
+            CUDA_CHECK(cudaMemcpy(d_nv13a[r].p, ha.data(), E * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_nv13d[r].p, &hd, 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_nv2a[r].p, ha.data(), E * 4, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_nv2d[r].p, &hd, 4, cudaMemcpyHostToDevice));
+
+            CUDA_CHECK(cudaMemset(d_mx13c[r].p, 0x32 + r * 3, mx_w13c_sz));
+            CUDA_CHECK(cudaMemset(d_mx13s[r].p, 120, mx_w13s_sz));
+            CUDA_CHECK(cudaMemset(d_mx2c[r].p, 0x31 + r * 4, mx_w2c_sz));
+            CUDA_CHECK(cudaMemset(d_mx2s[r].p, 120, mx_w2s_sz));
+        }
+
+        for (int is_mx = 0; is_mx < 2; ++is_mx) {
+            cudaGraph_t g_f = nullptr; cudaGraphExec_t e_f = nullptr;
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaStreamBeginCapture(st[0], cudaStreamCaptureModeRelaxed));
+            CUDA_CHECK(cudaEventRecord(ev01, st[0]));
+            CUDA_CHECK(cudaStreamWaitEvent(st[1], ev01, 0));
+            for (int r = 0; r < 2; ++r) {
+                CUDA_CHECK(cudaSetDevice(r));
+                Tensor tx = make_t(dxm[r].p, DType::BF16, H, 1);
+                Tensor to = make_t(dout_f[r].p, DType::BF16, H, 1);
+                ops::Inkling2Tp2ArSconvArgs ar{};
+                ar.pkt_local    = pkt_fus[r].p;
+                ar.pkt_peer     = pkt_fus[1 - r].p;
+                ar.sconv_weight = dsw[r].p;
+                ar.state_pool   = static_cast<float*>(dst_f[r].p);
+                ar.lane_ids     = static_cast<const std::int32_t*>(dlane[r].p);
+                ar.lane_stride  = kLaneStride;
+                ar.residual_add = dres[r].p;
+                if (!is_mx) {
+                    ops::inkling2_moe_nvfp4_forward(
+                        tx, d_nv13c[r].p, d_nv13s[r].p, static_cast<const float*>(d_nv13a[r].p),
+                        static_cast<const float*>(d_nv13d[r].p), d_nv2c[r].p, d_nv2s[r].p,
+                        static_cast<const float*>(d_nv2a[r].p),
+                        static_cast<const float*>(d_nv2d[r].p), 1, 4.0f, 25.0f, sc[r], to, st[r],
+                        false, false, &ar);
+                } else {
+                    ops::inkling2_moe_mxfp8_forward(
+                        tx, d_mx13c[r].p, d_mx13s[r].p, d_mx2c[r].p, d_mx2s[r].p, 1, 4.0f, 25.0f,
+                        sc[r], to, st[r], false, false, &ar);
+                }
+            }
+            CUDA_CHECK(cudaSetDevice(1));
+            CUDA_CHECK(cudaEventRecord(ev10, st[1]));
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaStreamWaitEvent(st[0], ev10, 0));
+            CUDA_CHECK(cudaStreamEndCapture(st[0], &g_f));
+            CUDA_CHECK(cudaGraphInstantiate(&e_f, g_f, nullptr, nullptr, 0));
+            CUDA_CHECK(cudaGraphUpload(e_f, st[0]));
+
+            for (int rep = 0; rep < 4; ++rep) {
+                std::vector<std::int32_t> hids(8);
+                std::vector<float> htw(8);
+                for (int k = 0; k < 8; ++k) {
+                    hids[k] = (rep * 13 + k * 7) % E;
+                    htw[k]  = 0.6f + 0.1f * k;
+                }
+                for (int r = 0; r < 2; ++r) {
+                    CUDA_CHECK(cudaSetDevice(r));
+                    auto hx   = rand_bf16(rng, H, 0.35f);
+                    auto hres = rand_bf16(rng, H, 0.4f);
+                    CUDA_CHECK(cudaMemcpy(dxm[r].p, hx.data(), H * 2, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(dres[r].p, hres.data(), H * 2, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(dtids[r].p, hids.data(), 8 * 4, cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaMemcpy(dtw[r].p, htw.data(), 8 * 4, cudaMemcpyHostToDevice));
+                }
+                for (int r = 0; r < 2; ++r) {
+                    CUDA_CHECK(cudaSetDevice(r));
+                    Tensor tx = make_t(dxm[r].p, DType::BF16, H, 1);
+                    Tensor tt = make_t(dtmp[r].p, DType::BF16, H, 1);
+                    Tensor tsw = make_t(dsw[r].p, DType::BF16, 4, H);
+                    Tensor to = make_t(dout_b[r].p, DType::BF16, H, 1);
+                    Tensor tres = make_t(dres[r].p, DType::BF16, H, 1);
+                    if (!is_mx) {
+                        ops::inkling2_moe_nvfp4_forward(
+                            tx, d_nv13c[r].p, d_nv13s[r].p, static_cast<const float*>(d_nv13a[r].p),
+                            static_cast<const float*>(d_nv13d[r].p), d_nv2c[r].p, d_nv2s[r].p,
+                            static_cast<const float*>(d_nv2a[r].p),
+                            static_cast<const float*>(d_nv2d[r].p), 1, 4.0f, 25.0f, sc[r], tt,
+                            st[r], false, false, nullptr);
+                    } else {
+                        ops::inkling2_moe_mxfp8_forward(
+                            tx, d_mx13c[r].p, d_mx13s[r].p, d_mx2c[r].p, d_mx2s[r].p, 1, 4.0f,
+                            25.0f, sc[r], tt, st[r], false, false, nullptr);
+                    }
+                    ops::inkling2_tp2_packet_allreduce_sconv_decode(
+                        tt, pkt_base[r].p, pkt_base[1 - r].p, kBaseEpochBytes, tsw,
+                        static_cast<float*>(dst_b[r].p),
+                        static_cast<const std::int32_t*>(dlane[r].p), 1, kLaneStride, to, &tres,
+                        nullptr, nullptr, st[r]);
+                }
+                CUDA_CHECK(cudaSetDevice(0));
+                CUDA_CHECK(cudaGraphLaunch(e_f, st[0]));
+                for (int r = 0; r < 2; ++r) { CUDA_CHECK(cudaSetDevice(r)); CUDA_CHECK(cudaStreamSynchronize(st[r])); }
+            }
+            for (int r = 0; r < 2; ++r) {
+                CUDA_CHECK(cudaSetDevice(r));
+                std::vector<std::uint16_t> ob(H), of(H);
+                std::vector<std::uint32_t> sb(kLaneStride), sf(kLaneStride);
+                CUDA_CHECK(cudaMemcpy(ob.data(), dout_b[r].p, H * 2, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(of.data(), dout_f[r].p, H * 2, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(sb.data(), dst_b[r].p, kLaneStride * 4, cudaMemcpyDeviceToHost));
+                CUDA_CHECK(cudaMemcpy(sf.data(), dst_f[r].p, kLaneStride * 4, cudaMemcpyDeviceToHost));
+                char lbl[96];
+                std::snprintf(lbl, sizeof(lbl), "tp2_moe_%s_w2_ar_sconv Graph 4x (r=%d) out",
+                              is_mx ? "mxfp8" : "nvfp4", r);
+                assert_u16_exact(lbl, ob, of);
+                std::snprintf(lbl, sizeof(lbl), "tp2_moe_%s_w2_ar_sconv Graph 4x (r=%d) state",
+                              is_mx ? "mxfp8" : "nvfp4", r);
+                assert_u32_exact(lbl, sb, sf);
+            }
+            CUDA_CHECK(cudaSetDevice(0));
+            CUDA_CHECK(cudaGraphExecDestroy(e_f));
+            CUDA_CHECK(cudaGraphDestroy(g_f));
+        }
+    }
+
+    CUDA_CHECK(cudaSetDevice(0));
+    CUDA_CHECK(cudaEventDestroy(ev01));
+    CUDA_CHECK(cudaSetDevice(1));
+    CUDA_CHECK(cudaEventDestroy(ev10));
+    for (int r = 0; r < 2; ++r) {
+        CUDA_CHECK(cudaSetDevice(r));
+        CUDA_CHECK(cudaStreamDestroy(st[r]));
+    }
+    CUDA_CHECK(cudaSetDevice(0));
+}
+
 } // namespace
 
 int main() {
@@ -3104,6 +3479,7 @@ int main() {
         test_attention(stream);
         test_sparse_moe(stream);
         test_dspark_ops(stream);
+        test_tp2_fused_ar_sconv();
         std::printf("=== ALL INKLING-2-MINI OP TESTS PASSED ===\n");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAILURE: %s\n", e.what());

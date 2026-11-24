@@ -77,8 +77,8 @@ Workload: 4 essay prompts (`C=1, 4`, `bench_ninfer.py`), `max_tokens=256`, `temp
 
 | Engine / Mode | Weights | C=1 e2e (tok/s) | C=4 agg (tok/s) | C=8 agg (tok/s) |
 |---|---|---:|---:|---:|
-| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **135.8** *(was 122.0 / orig 104.8)* | **272.0** *(was 268.2 / orig 238.0)* | **358.4** *(was 356.9)* |
-| **NInfer Normal (`temp=0.7, top_p=0.95`)** | Native NVFP4 + MXFP8 + BF16 (lossless) | **134.6** *(was 121.1)* | **270.6** *(was 267.3)* | — |
+| **NInfer Normal** | Native NVFP4 + MXFP8 + BF16 (lossless) | **142.8** *(was 135.8 / orig 104.8)* | **271.9** *(was 272.0 / orig 238.0)* | **358.4** *(was 356.9)* |
+| **NInfer Normal (`temp=0.7, top_p=0.95`)** | Native NVFP4 + MXFP8 + BF16 (lossless) | **139.5** *(was 134.6)* | **270.6** *(was 267.3)* | — |
 | **NInfer DSpark-2** (`--spec mtp --draft-tokens 2`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **129.0** *(was 127.3 / orig 106.9)* | **209.6** *(was 208.9 / orig 175.4)* | **238.3** *(was 241.1)* |
 | **NInfer DSpark-3** (`--spec mtp --draft-tokens 3`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **129.0** *(was 122.0 / orig 102.0)* | **191.0** *(was 189.9 / orig 166.2)* | — |
 | **NInfer DSpark-7** (`--spec dflash --draft-tokens 7`) | Native NVFP4 + MXFP8 + BF16 (lossless) | **87.4** *(was 94.5 / orig 75.2)* | **115.6** *(was 119.4 / orig 104.7)* | — |
@@ -87,17 +87,20 @@ Workload: 4 essay prompts (`C=1, 4`, `bench_ninfer.py`), `max_tokens=256`, `temp
 | `llama.cpp` + DSpark-3 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 29.3 / 19.8 | 47.7 / 28.5 | — |
 | `llama.cpp` + DSpark-7 | `UD-Q4_K_XL` / `UD-Q8_K_XL` | 24.2 / 16.3 | 39.3 / 23.8 | — |
 
-- Compared with `llama.cpp UD-Q4_K_XL` Normal: **4.42×** faster at C=1 Normal (`135.8` vs `30.7`) and **3.47×** faster at C=4 (`272.0` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
-- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.63×** faster at C=1 and **4.87×** faster at C=4.
-- **Wave 6 latency-kernel fusion (`f2ac23ba` → current)**: collapsing Pre-Attn Core QKV (Group B: 4→1 launch), Pre-MoE Non-Core AttnRes+Router (Group C: 2→1 launch), and Pre-MoE Core AttnRes+LoopCtrl+Router (Group D: 5→1 launch) plus Split-Q AttnRes and 4-warp Bitonic Top-8 routing cuts C=1 launches from **`681 → 489` / step (`-28.2%`)** and eager CUPTI step wall time from **`8,054.7 → 7,256.2 µs` (`-9.9%`)** (target AttnRes + LoopCtrl + Router kernel time `1,887.8 → 1,224.8 µs/step`, `-35.1%`; inter-kernel gaps `703.9 → 465.0 µs/step`, `-33.9%`). End-to-end Normal C=1 improves **`+11.3%`** (`122.0 → 135.8 tok/s` greedy, `121.1 → 134.6 tok/s` at `temp=0.7`), overtaking DSpark-2/3 on low-acceptance essay prompts, while Normal C=4/C=8 and DSpark-2/3 C=1/C=4 also improve (`+0.4%` to `+5.7%`). On DSpark-7 essays, lower draft acceptance shifts wall `tok/s` (`94.5 → 87.4`); per-round verification latency on code stays within `+1.5%` (`21.47 → 21.80 ms/rnd`).
+- Compared with `llama.cpp UD-Q4_K_XL` Normal: **4.65×** faster at C=1 Normal (`142.8` vs `30.7`) and **3.47×** faster at C=4 (`271.9` vs `78.3`), while keeping lossless native weights instead of requantized 4-bit GGUF.
+- Compared with `llama.cpp UD-Q8_K_XL` Normal: **4.87×** faster at C=1 and **4.86×** faster at C=4.
+- **Wave 7 zero-barrier TP2 projection + Packet AllReduce + ShortConv fusion (`e476faac` → current)**:
+  - An A/B/C hardware gate on 44 L2-cold NVFP4 layers established that fusing `w13 → w2` via `cudaLaunchCooperativeKernel` + `cooperative_groups::this_grid().sync()` (`62` regs, `0 B` stack/spills, `maxCoopGrid=640`, bit-exact) loses **`+37.2 µs`** (`-2.45%`) vs two-launch CUDA Graph baseline (`1,518.8 µs`), and single-launch 44-layer persistence loses **`+201.1 µs`** (`-13.24%`), because 288-CTA software grid barriers on `sm_70` (`~3.0 µs` each) cost more than hardware CUDA Graph launch boundaries (`~1.5 µs`) without removing global `inter_buf` traffic. That cooperative path was rejected by the gate.
+  - Instead, fusing **zero-barrier row-local epilogues** directly into all 96 `T=1` row-parallel projections (`48× o_proj` + `44× NVFP4 w2` + `4× MXFP8 w2`, 288 CTAs = 1 CTA per `Bf16x8Pack`, dedicated 10.4 KiB per-pack two-epoch mailboxes, occupancy-gated on `maxRes >= 288` per rank) eliminates **96 kernel launches/step** (`489 → 393`, `-19.6%`) and 96 HBM round-trips while overlapping PCIe P2P flight with weight streaming and SConv/state prefetching (`0` extra registers, `0 B` stack/spills). Server Normal C=1 e2e rises **`135.8 → 142.8 tok/s` (`+5.2%`)**, CLI Code Normal C=1 reaches **`150.1 tok/s` (`6.66 ms/tok`, `+7.4%`)**, 4.2K context reaches **`130.7 tok/s`**, and 15.4K context reaches **`114.8 tok/s`**.
+- **Wave 6 latency-kernel fusion (`f2ac23ba` → `e476faac`)**: collapsing Pre-Attn Core QKV (Group B: 4→1 launch), Pre-MoE Non-Core AttnRes+Router (Group C: 2→1 launch), and Pre-MoE Core AttnRes+LoopCtrl+Router (Group D: 5→1 launch) plus Split-Q AttnRes and 4-warp Bitonic Top-8 routing cuts C=1 launches from **`681 → 489` / step (`-28.2%`)** and eager CUPTI step wall time from **`8,054.7 → 7,256.2 µs` (`-9.9%`)** (target AttnRes + LoopCtrl + Router kernel time `1,887.8 → 1,224.8 µs/step`, `-35.1%`; inter-kernel gaps `703.9 → 465.0 µs/step`, `-33.9%`). End-to-end Normal C=1 improved **`+11.3%`** (`122.0 → 135.8 tok/s` greedy, `121.1 → 134.6 tok/s` at `temp=0.7`).
 
 ### Structured / code generation & 4K–16K long-context DSpark showcase (C=1, greedy, `--no-thinking`)
 
 | Workload | Normal | DSpark-2 | DSpark-3 | DSpark-7 |
 |---|---:|---:|---:|---:|
-| Python dataclass refactor (256 tok, engine decode) | **139.79 tok/s** (`7.15 ms/tok`, *was 128.47 / orig 106.08, +31.8%*) | **174.83 tok/s** (`2.26` tok/rnd, 62.8%, `12.93 ms/rnd`, *was 168.90*) | **176.29 tok/s** (`2.55` tok/rnd, 51.7%, `14.46 ms/rnd`, *was 166.68*) | **132.59 tok/s** (`2.89` tok/rnd, 27.0%, `21.80 ms/rnd`, *was 145.32 @ `3.12`*) |
-| 4,274-tok needle retrieval (`--max-context 8192`, 128 new) | **124.83 tok/s** (`8.01 ms/tok`, *was 114.24 / orig 83.00, +50.4%*) | — | **152.57 tok/s** (`2.68` tok/rnd, `17.57 ms/rnd`, *was 181.82 @ `3.10`*) | — |
-| 16,304-tok long-context decode (`--max-context 20480`, 128 new) | **107.23 tok/s** (`9.33 ms/tok`, *was 99.32, +8.0%*) | — | **110.69 tok/s** (`2.25` tok/rnd, `20.33 ms/rnd`, *was 131.78 @ `2.65`*) | — |
+| Python dataclass refactor (256 tok, engine decode) | **150.1 tok/s** (`6.66 ms/tok`, *was 139.8 / orig 106.1, +41.5%*) | **174.83 tok/s** (`2.26` tok/rnd, 62.8%, `12.93 ms/rnd`) | **176.29 tok/s** (`2.55` tok/rnd, 51.7%, `14.46 ms/rnd`) | **132.59 tok/s** (`2.89` tok/rnd, 27.0%, `21.80 ms/rnd`) |
+| ~4.2K-tok needle retrieval (`--max-context 8192`, 128 new) | **130.73 tok/s** (`7.65 ms/tok` @ 4,272 tok, *was 124.83 / orig 83.00, +57.5%*) | — | **152.57 tok/s** (`2.68` tok/rnd, `17.57 ms/rnd`) | — |
+| ~15K–16K-tok long-context decode (`--max-context 20480`, 128 new) | **114.81 tok/s** (`8.71 ms/tok` @ 15,409 tok, *was 107.23 @ 16,304*) | — | **110.69 tok/s** (`2.25` tok/rnd, `20.33 ms/rnd`) | — |
 
 - Single-run DSpark `tok/s` on 4K/16K and DSpark-7 reflects run-to-run draft acceptance variance from multi-token `atomicAdd` MoE accumulation (`3.10 → 2.68` at 4K, `2.65 → 2.25` at 16K, `3.12 → 2.89` on Code DSpark-7); per-round kernel latencies remain nearly flat (`17.05 → 17.57`, `20.11 → 20.33`, `21.47 → 21.80 ms/rnd`), while Normal C=1 improves **`+8.0%` to `+9.3%`** across short, 4K, and 16K contexts (`7.15 / 8.01 / 9.33 ms/tok`).
 - Per-round decode latency reaches **`7.15 ms/tok`** (Normal C=1, `139.8 tok/s` greedy / `140.0 tok/s` at `temp=0.7`), **`12.93 ms/rnd`** (DSpark-2), and **`14.46 ms/rnd`** (DSpark-3); structured code reaches **`174.8–176.3 tok/s`** while preserving lossless weights and exact 32/32 PyTorch greedy parity.
@@ -149,11 +152,7 @@ server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–6
   `PreStaged` `T=1` NVFP4/MXFP8 kernels, SMEM-staged `TileM=4` grouped `w13` (`18 KB` SMEM,
   specialized `mc=1/2/3..4`, 2-deep prefetch), and 128-row/CTA grouped `w2` (`0 B` stack/spills
   verified via `ptxas -v` on every hot kernel).
-- **Fused TP2 packet-push AllReduce + ShortConv (`src/ops/inkling2/sconv.cu`)**: fuses TP2 direct
-  P2P two-epoch packet reduction, optional FP32→BF16 cast from MoE `accum_f32`, `attn_sconv` /
-  `mlp_sconv`, and residual/block update into a single kernel for **both** Decode (`T=1..8`) and
-  Verify (`V=2..8`, row-major coalesced Phase 1, bank-conflict-free SMEM Phase 2, compile-time
-  `FixV` for `V=3,4,6,8`), plus fused TP2 packet AllReduce + residual add for DSpark MTP layers.
+- **Fused TP2 packet-push AllReduce + ShortConv (`src/ops/inkling2/sconv.cu`, `tp2_packet_epilogue.cuh`, `bf16_linear.cu`, `sparse_moe.cu`)**: at `T=1` on qualified `sm_70` TP2 (`maxRes >= 288` CTAs per rank), embeds a zero-barrier per-pack (288-CTA, dedicated 10.4 KiB mailbox) two-epoch packet AllReduce + static SConv + residual/block-copy epilogue directly inside `o_proj`, NVFP4 `w2`, and MXFP8 `w2` (eliminating 96 launches/step and overlapping P2P transfer with weight streaming and SConv/state prefetching); for `T=2..8` Decode and `V=2..8` Verify retains fused packet AllReduce + optional FP32→BF16 cast + SConv + residual/block update (compile-time `FixV` for `V=3,4,6,8`), plus fused TP2 packet AllReduce + residual add for DSpark MTP layers.
 - **Attention, loop-control, and DSpark fusion (`attention.cu`, `attn_res_control.cu`, `dspark.cu`)**:
   single-launch adaptive Last-CTA Q-head Split-KV for both main attention and DSpark block attention
   (zero reduce launches, zero scratch at short context, cached global page lookups, and a
@@ -168,9 +167,10 @@ server `TTFT` across 3 repeats (`512–16,385` tokens) or 2 repeats (`32,768–6
 
 ## Verification and limitations
 
-- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **307/307 PASS** against
+- **Operator tests**: `./build-sm70/tests/ninfer_inkling2_ops_test` — **325/325 PASS** against
   independent FP64 oracles, bit-exact direct-BF16 unembed & `T=1` PreStaged MoE checks, TP1/TP2
-  shard-equivalence, two-epoch packet loopback, long-context adaptive Split-KV (`1,100–1,200`
+  shard-equivalence, two-epoch packet loopback, 2-GPU Peer-Capture CUDA Graph bit-exact checks for
+  fused `o_proj` / NVFP4 `w2` / MXFP8 `w2` TP2 AR+SConv epilogues, long-context adaptive Split-KV (`1,100–1,200`
   tokens across SWA ring wrap & permuted global pages, plus `4,096` / `4,100`-token global cases),
   Bitonic Top-8 tie-break checks, fused Group B/C/D & Split-Q AttnRes parity checks, and
   16-iteration CUDA Graph replay checks (including alternating 72-CTA Group B and 64-CTA Group D

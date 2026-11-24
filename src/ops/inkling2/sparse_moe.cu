@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "ops/common/volta_mma.cuh"
+#include "ops/inkling2/tp2_packet_epilogue.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -1428,15 +1429,21 @@ __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w13_kernel(
     }
 }
 
+template <bool FusedAr>
 __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w2_kernel(
     const half* __restrict__ inter_in, const std::uint8_t* __restrict__ w2_codes,
     const std::uint8_t* __restrict__ w2_scales, const float* __restrict__ w2_amax,
     const float* __restrict__ w2_denom, const std::int32_t* __restrict__ topk_ids,
-    int num_slabs, __nv_bfloat16* __restrict__ out) {
+    int num_slabs, __nv_bfloat16* __restrict__ out, void* __restrict__ pkt_local,
+    void* __restrict__ pkt_peer, const __nv_bfloat16* __restrict__ sconv_w,
+    float* __restrict__ state_pool, const std::int32_t* __restrict__ lane_ids,
+    std::size_t lane_stride, const __nv_bfloat16* __restrict__ residual_add) {
     __shared__ uint4 s_inter[8][36][2];
     __shared__ float s_exp[8][8];
     __shared__ int s_eid[8];
     __shared__ float s_outer[8];
+    alignas(16) __shared__ __nv_bfloat16 s_local_bf16[8];
+    __shared__ detail::Tp2Bf16x8Pack s_peer_pack;
 
     const int tid    = threadIdx.x;    // 0..127
     const int slot   = tid >> 4;       // 0..7 (ALL 8 experts in parallel, 1 half-warp/expert!)
@@ -1511,7 +1518,14 @@ __global__ __launch_bounds__(128, 8) void moe_nvfp4_t1_w2_kernel(
     if (tid < 8) {
         const float sum = ((s_exp[0][tid] + s_exp[1][tid]) + (s_exp[2][tid] + s_exp[3][tid])) +
                           ((s_exp[4][tid] + s_exp[5][tid]) + (s_exp[6][tid] + s_exp[7][tid]));
-        out[blockIdx.x * 8 + tid] = __float2bfloat16_rn(sum);
+        if constexpr (FusedAr) {
+            s_local_bf16[tid] = __float2bfloat16_rn(sum);
+            detail::tp2_packet_ar_sconv_epilogue_w0(
+                static_cast<int>(blockIdx.x), s_local_bf16, &s_peer_pack, pkt_local, pkt_peer,
+                sconv_w, state_pool, lane_ids, lane_stride, out, residual_add, nullptr, nullptr);
+        } else {
+            out[blockIdx.x * 8 + tid] = __float2bfloat16_rn(sum);
+        }
     }
 }
 
@@ -1629,13 +1643,19 @@ __global__ __launch_bounds__(128, 6) void moe_mxfp8_t1_w13_kernel(
     }
 }
 
+template <bool FusedAr>
 __global__ __launch_bounds__(128, 6) void moe_mxfp8_t1_w2_kernel(
     const half* __restrict__ inter_in, const std::uint8_t* __restrict__ w2_codes,
     const std::uint8_t* __restrict__ w2_scales, const std::int32_t* __restrict__ topk_ids,
-    int num_slabs, __nv_bfloat16* __restrict__ out) {
+    int num_slabs, __nv_bfloat16* __restrict__ out, void* __restrict__ pkt_local,
+    void* __restrict__ pkt_peer, const __nv_bfloat16* __restrict__ sconv_w,
+    float* __restrict__ state_pool, const std::int32_t* __restrict__ lane_ids,
+    std::size_t lane_stride, const __nv_bfloat16* __restrict__ residual_add) {
     alignas(16) __shared__ half2 s_inter[8][18][16];
     __shared__ float s_warp[4][8];
     __shared__ int s_eid[8];
+    alignas(16) __shared__ __nv_bfloat16 s_local_bf16[8];
+    __shared__ detail::Tp2Bf16x8Pack s_peer_pack;
 
     const int tid    = threadIdx.x;
     const int warp   = tid >> 5;
@@ -1734,7 +1754,14 @@ __global__ __launch_bounds__(128, 6) void moe_mxfp8_t1_w2_kernel(
 
     if (tid < 8) {
         const float sum = (s_warp[0][tid] + s_warp[1][tid]) + (s_warp[2][tid] + s_warp[3][tid]);
-        out[blockIdx.x * 8 + tid] = __float2bfloat16_rn(sum);
+        if constexpr (FusedAr) {
+            s_local_bf16[tid] = __float2bfloat16_rn(sum);
+            detail::tp2_packet_ar_sconv_epilogue_w0(
+                static_cast<int>(blockIdx.x), s_local_bf16, &s_peer_pack, pkt_local, pkt_peer,
+                sconv_w, state_pool, lane_ids, lane_stride, out, residual_add, nullptr, nullptr);
+        } else {
+            out[blockIdx.x * 8 + tid] = __float2bfloat16_rn(sum);
+        }
     }
 }
 
@@ -3243,13 +3270,31 @@ void inkling2_attn_res_loop_ctrl_moe_router_fused(
                               prep_mode);
 }
 
+bool inkling2_can_fuse_tp2_ar_sconv_t1_moe(int device) {
+    int prev = 0;
+    CUDA_CHECK(cudaGetDevice(&prev));
+    if (prev != device) { CUDA_CHECK(cudaSetDevice(device)); }
+    int sms       = 0;
+    int bpm_nvfp4 = 0;
+    int bpm_mxfp8 = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &bpm_nvfp4, moe_nvfp4_t1_w2_kernel<true>, 128, 0));
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &bpm_mxfp8, moe_mxfp8_t1_w2_kernel<true>, 128, 0));
+    if (prev != device) { CUDA_CHECK(cudaSetDevice(prev)); }
+    return (bpm_nvfp4 * sms) >= detail::kTp2FusedPacks &&
+           (bpm_mxfp8 * sms) >= detail::kTp2FusedPacks;
+}
+
 void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const void* w13_scales,
                                 const float* w13_amax, const float* w13_denom,
                                 const void* w2_codes, const void* w2_scales,
                                 const float* w2_amax, const float* w2_denom,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
                                 Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
-                                bool skip_prep, bool skip_cast_out) {
+                                bool skip_prep, bool skip_cast_out,
+                                const Inkling2Tp2ArSconvArgs* fused_ar) {
     const int tokens = x.ne[1];
     if (tokens == 1) {
         const int inter_local = num_slabs * kInterPerSlab;
@@ -3272,11 +3317,23 @@ void inkling2_moe_nvfp4_forward(const Tensor& x, const void* w13_codes, const vo
         }
         CUDA_CHECK(cudaGetLastError());
 
-        moe_nvfp4_t1_w2_kernel<<<kHidden / 8, 128, 0, stream>>>(
-            static_cast<const half*>(scratch.intermediate_bf16),
-            static_cast<const std::uint8_t*>(w2_codes),
-            static_cast<const std::uint8_t*>(w2_scales), w2_amax, w2_denom, scratch.topk_ids,
-            num_slabs, static_cast<__nv_bfloat16*>(out.data));
+        if (fused_ar != nullptr) {
+            moe_nvfp4_t1_w2_kernel<true><<<kHidden / 8, 128, 0, stream>>>(
+                static_cast<const half*>(scratch.intermediate_bf16),
+                static_cast<const std::uint8_t*>(w2_codes),
+                static_cast<const std::uint8_t*>(w2_scales), w2_amax, w2_denom, scratch.topk_ids,
+                num_slabs, static_cast<__nv_bfloat16*>(out.data), fused_ar->pkt_local,
+                fused_ar->pkt_peer, static_cast<const __nv_bfloat16*>(fused_ar->sconv_weight),
+                fused_ar->state_pool, fused_ar->lane_ids, fused_ar->lane_stride,
+                static_cast<const __nv_bfloat16*>(fused_ar->residual_add));
+        } else {
+            moe_nvfp4_t1_w2_kernel<false><<<kHidden / 8, 128, 0, stream>>>(
+                static_cast<const half*>(scratch.intermediate_bf16),
+                static_cast<const std::uint8_t*>(w2_codes),
+                static_cast<const std::uint8_t*>(w2_scales), w2_amax, w2_denom, scratch.topk_ids,
+                num_slabs, static_cast<__nv_bfloat16*>(out.data), nullptr, nullptr, nullptr,
+                nullptr, nullptr, 0, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -3351,7 +3408,8 @@ void inkling2_moe_mxfp8_forward(const Tensor& x, const void* w13_codes, const vo
                                 const void* w2_codes, const void* w2_scales,
                                 std::int32_t num_slabs, float gate_cap, float up_cap,
                                 Inkling2MoeScratch& scratch, Tensor& out, cudaStream_t stream,
-                                bool skip_prep, bool skip_cast_out) {
+                                bool skip_prep, bool skip_cast_out,
+                                const Inkling2Tp2ArSconvArgs* fused_ar) {
     const int tokens = x.ne[1];
     if (tokens == 1) {
         const int inter_local = num_slabs * kInterPerSlab;
@@ -3372,11 +3430,23 @@ void inkling2_moe_mxfp8_forward(const Tensor& x, const void* w13_codes, const vo
         }
         CUDA_CHECK(cudaGetLastError());
 
-        moe_mxfp8_t1_w2_kernel<<<kHidden / 8, 128, 0, stream>>>(
-            static_cast<const half*>(scratch.intermediate_bf16),
-            static_cast<const std::uint8_t*>(w2_codes),
-            static_cast<const std::uint8_t*>(w2_scales), scratch.topk_ids, num_slabs,
-            static_cast<__nv_bfloat16*>(out.data));
+        if (fused_ar != nullptr) {
+            moe_mxfp8_t1_w2_kernel<true><<<kHidden / 8, 128, 0, stream>>>(
+                static_cast<const half*>(scratch.intermediate_bf16),
+                static_cast<const std::uint8_t*>(w2_codes),
+                static_cast<const std::uint8_t*>(w2_scales), scratch.topk_ids, num_slabs,
+                static_cast<__nv_bfloat16*>(out.data), fused_ar->pkt_local, fused_ar->pkt_peer,
+                static_cast<const __nv_bfloat16*>(fused_ar->sconv_weight), fused_ar->state_pool,
+                fused_ar->lane_ids, fused_ar->lane_stride,
+                static_cast<const __nv_bfloat16*>(fused_ar->residual_add));
+        } else {
+            moe_mxfp8_t1_w2_kernel<false><<<kHidden / 8, 128, 0, stream>>>(
+                static_cast<const half*>(scratch.intermediate_bf16),
+                static_cast<const std::uint8_t*>(w2_codes),
+                static_cast<const std::uint8_t*>(w2_scales), scratch.topk_ids, num_slabs,
+                static_cast<__nv_bfloat16*>(out.data), nullptr, nullptr, nullptr, nullptr, nullptr,
+                0, nullptr);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

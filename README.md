@@ -15,17 +15,17 @@ Measured on **2 × Tesla V100-SXM2 16 GB** (PCIe P2P, **150 W** power cap, CUDA 
 
 | Workload / Mode | NInfer (lossless NVFP4+MXFP8) | `llama.cpp` `UD-Q4_K_XL` | `llama.cpp` `UD-Q8_K_XL` |
 |---|---:|---:|---:|
-| Essay 256 tok, C=1 Normal / DSpark-2 / DSpark-3 (e2e) | **135.8** / **129.0** / **129.0 tok/s** | 30.7 tok/s | 29.3 tok/s |
-| Essay 256 tok, C=1 / C=4 `temp=0.7, top_p=0.95` (CUDA Graph) | **134.6** / **270.6 tok/s** | — | — |
-| Essay 256 tok, C=4 Normal / DSpark-2 (agg) | **272.0** / **209.6 tok/s** | 78.3 tok/s | 55.9 tok/s |
+| Essay 256 tok, C=1 Normal / DSpark-2 / DSpark-3 (e2e) | **142.8** / **129.0** / **129.0 tok/s** | 30.7 tok/s | 29.3 tok/s |
+| Essay 256 tok, C=1 / C=4 `temp=0.7, top_p=0.95` (CUDA Graph) | **139.5** / **270.6 tok/s** | — | — |
+| Essay 256 tok, C=4 Normal / DSpark-2 (agg) | **271.9** / **209.6 tok/s** | 78.3 tok/s | 55.9 tok/s |
 | Essay 256 tok, C=8 Normal / DSpark-2 (agg) | **358.4** / **238.3 tok/s** | — | — |
-| Code refactor 256 tok, C=1 Normal / DSpark-2 / DSpark-3 (engine) | **139.8** / **174.8** / **176.3 tok/s** | — | — |
-| 4,274-tok needle, C=1 Normal / DSpark-3 | **124.8** / **152.6 tok/s** | — | — |
-| 16,304-tok long-context decode, C=1 Normal / DSpark-3 | **107.2** / **110.7 tok/s** | — | — |
+| Code refactor 256 tok, C=1 Normal / DSpark-2 / DSpark-3 (engine) | **150.1** / **174.8** / **176.3 tok/s** | — | — |
+| ~4.2K-tok needle, C=1 Normal / DSpark-3 | **130.7** / **152.6 tok/s** | — | — |
+| ~15.4K–16.3K-tok long-context decode, C=1 Normal / DSpark-3 | **114.8** / **110.7 tok/s** | — | — |
 | Cold prefill (512 / 4K / 16K / 64K tok), Normal (`chunk=1024`, `2048` at ≥16K) | **1,033.7** / **882.8** / **709.1** / **417.8 tok/s** | — | — |
 | Cold prefill (512 / 4K / 16K / 64K tok), DSpark-3 (`chunk=1024`) | 1,001.5 / 851.0 / 684.2 / 401.2 tok/s | — | — |
 
-Verified with **307/307** FP64/TP2/CUDA-Graph operator unit tests (0 B stack/spills on all hot kernels),
+Verified with **325/325** FP64/TP2/CUDA-Graph operator unit tests (0 B stack/spills on all hot kernels),
 **32/32** exact token parity against the PyTorch reference across Normal (Graph/Eager),
 DSpark-2/3/5/7, and Graph-captured Direct-BF16 sampling (`--temperature 0.01`), HF `AutoTokenizer` parity, 4K/16K
 SWA-1024/Paged-KV long-context decode, full native 262K max-context planning, and `C=1..8`
